@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -38,17 +39,23 @@ type SessionRuntime struct {
 	session   store.Session
 	workspace store.Workspace
 	command   string
-	cmd       *exec.Cmd
-	ptyFile   *os.File
+	mode      string
 
 	store *store.Store
 	mgr   *Manager
 
-	mu         sync.Mutex
-	subs       map[string]*subscriber
-	pendingOut strings.Builder
-	flushTimer *time.Timer
-	closed     bool
+	cmd       *exec.Cmd
+	ptyFile   *os.File
+	cursorCmd string
+	chatID    string
+	inputs    chan string
+
+	mu            sync.Mutex
+	subs          map[string]*subscriber
+	pendingOut    strings.Builder
+	flushTimer    *time.Timer
+	closed        bool
+	currentCancel context.CancelFunc
 }
 
 type subscriber struct {
@@ -114,27 +121,24 @@ func (m *Manager) startRuntime(session store.Session, workspace store.Workspace)
 		return nil, errors.New("session launch command is empty")
 	}
 
-	// Cursor prompts for workspace trust on first run in a directory.
-	// Bootstrap trust in non-interactive mode so mobile sessions start cleanly.
-	maybeBootstrapCursorTrust(workspace.LocalPath, command)
-
-	cmd := exec.Command("bash", "-lc", command)
-	cmd.Dir = workspace.LocalPath
-
-	ptyFile, err := pty.Start(cmd)
-	if err != nil {
-		return nil, fmt.Errorf("start command %q: %w", command, err)
-	}
-
 	rt := &SessionRuntime{
 		session:   session,
 		workspace: workspace,
 		command:   command,
-		cmd:       cmd,
-		ptyFile:   ptyFile,
 		store:     m.store,
 		mgr:       m,
 		subs:      make(map[string]*subscriber),
+	}
+
+	cursorExec, isCursor := cursorExecutableFromCommand(command)
+	if isCursor {
+		if err := rt.startCursorMode(cursorExec); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := rt.startPTYMode(); err != nil {
+			return nil, err
+		}
 	}
 
 	_ = m.store.UpdateSessionState(context.Background(), session.ID, "active", "")
@@ -144,12 +148,123 @@ func (m *Manager) startRuntime(session store.Session, workspace store.Workspace)
 		State:     "active",
 		Timestamp: time.Now().UTC(),
 	})
-
-	go rt.readLoop()
 	return rt, nil
 }
 
+func (rt *SessionRuntime) startPTYMode() error {
+	cmd := exec.Command("bash", "-lc", rt.command)
+	cmd.Dir = rt.workspace.LocalPath
+
+	ptyFile, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("start command %q: %w", rt.command, err)
+	}
+
+	rt.mode = "pty"
+	rt.cmd = cmd
+	rt.ptyFile = ptyFile
+	go rt.readLoop()
+	return nil
+}
+
+func (rt *SessionRuntime) startCursorMode(cursorExec string) error {
+	chatID := strings.TrimSpace(rt.session.CursorChatID)
+
+	// First run in a new workspace may require trust; bootstrap it once.
+	maybeBootstrapCursorTrust(rt.workspace.LocalPath, cursorExec)
+
+	if chatID == "" {
+		newChatID, err := ensureCursorChatID(cursorExec, rt.workspace.LocalPath)
+		if err != nil {
+			return err
+		}
+		chatID = newChatID
+		if err := rt.store.SetSessionCursorChatID(context.Background(), rt.session.ID, chatID); err != nil {
+			return fmt.Errorf("persist cursor chat id: %w", err)
+		}
+	}
+
+	rt.mode = "cursor_print"
+	rt.cursorCmd = cursorExec
+	rt.chatID = chatID
+	rt.inputs = make(chan string, 64)
+	go rt.cursorWorker()
+	return nil
+}
+
+func (rt *SessionRuntime) cursorWorker() {
+	for prompt := range rt.inputs {
+		rt.runCursorPrompt(prompt)
+	}
+}
+
+func (rt *SessionRuntime) runCursorPrompt(prompt string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	rt.mu.Lock()
+	rt.currentCancel = cancel
+	rt.mu.Unlock()
+
+	cmd := exec.CommandContext(
+		ctx,
+		rt.cursorCmd,
+		"--print",
+		"--output-format",
+		"text",
+		"--trust",
+		"--workspace",
+		rt.workspace.LocalPath,
+		"--resume",
+		rt.chatID,
+		prompt,
+	)
+	cmd.Dir = rt.workspace.LocalPath
+	output, err := cmd.CombinedOutput()
+
+	rt.mu.Lock()
+	rt.currentCancel = nil
+	rt.mu.Unlock()
+	cancel()
+
+	content := strings.TrimSpace(string(output))
+	if err != nil {
+		message := err.Error()
+		if content != "" {
+			message = content
+		}
+		_ = rt.store.UpdateSessionState(context.Background(), rt.session.ID, "error", message)
+		rt.broadcast(Event{
+			Type:      "error",
+			SessionID: rt.session.ID,
+			Error:     message,
+			Timestamp: time.Now().UTC(),
+		})
+		return
+	}
+
+	if content == "" {
+		content = "(No response text returned by Cursor)"
+	}
+
+	_, _ = rt.store.AddMessage(context.Background(), rt.session.ID, "assistant", content)
+	_ = rt.store.UpdateSessionState(context.Background(), rt.session.ID, "active", "")
+	_ = rt.store.TouchSession(context.Background(), rt.session.ID)
+	rt.broadcast(Event{
+		Type:      "message_delta",
+		SessionID: rt.session.ID,
+		Content:   content,
+		Timestamp: time.Now().UTC(),
+	})
+	rt.broadcast(Event{
+		Type:      "message_done",
+		SessionID: rt.session.ID,
+		Timestamp: time.Now().UTC(),
+	})
+}
+
 func (rt *SessionRuntime) readLoop() {
+	if rt.ptyFile == nil {
+		return
+	}
 	buf := make([]byte, 2048)
 	for {
 		n, err := rt.ptyFile.Read(buf)
@@ -258,6 +373,20 @@ func (rt *SessionRuntime) shutdown() error {
 	}
 	rt.mu.Unlock()
 
+	if rt.mode == "cursor_print" {
+		rt.mu.Lock()
+		cancel := rt.currentCancel
+		rt.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if rt.inputs != nil {
+			close(rt.inputs)
+		}
+		rt.cleanup()
+		return nil
+	}
+
 	if rt.cmd.Process != nil {
 		_ = rt.cmd.Process.Signal(os.Interrupt)
 		time.Sleep(500 * time.Millisecond)
@@ -273,6 +402,21 @@ func (rt *SessionRuntime) SendInput(input string) error {
 	if strings.TrimSpace(input) == "" {
 		return errors.New("input cannot be empty")
 	}
+
+	if rt.mode == "cursor_print" {
+		select {
+		case rt.inputs <- input:
+			_ = rt.store.TouchSession(context.Background(), rt.session.ID)
+			return nil
+		default:
+			return errors.New("session is busy, try again in a moment")
+		}
+	}
+
+	if rt.ptyFile == nil {
+		return errors.New("session runtime is unavailable")
+	}
+
 	if _, err := io.WriteString(rt.ptyFile, input+"\n"); err != nil {
 		return err
 	}
@@ -281,6 +425,17 @@ func (rt *SessionRuntime) SendInput(input string) error {
 }
 
 func (rt *SessionRuntime) Interrupt() error {
+	if rt.mode == "cursor_print" {
+		rt.mu.Lock()
+		cancel := rt.currentCancel
+		rt.mu.Unlock()
+		if cancel == nil {
+			return errors.New("no active request to interrupt")
+		}
+		cancel()
+		return nil
+	}
+
 	if rt.ptyFile == nil {
 		return errors.New("session is not running")
 	}
@@ -341,20 +496,20 @@ func (rt *SessionRuntime) broadcast(event Event) {
 }
 
 func maybeBootstrapCursorTrust(workspacePath, launchCommand string) {
-	cursorExec, isCursor := cursorExecutableFromCommand(launchCommand)
-	if !isCursor {
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	trustCommand := fmt.Sprintf(
-		"%s --print --trust --output-format text %s >/dev/null 2>&1",
-		shellQuote(cursorExec),
-		shellQuote("Trust bootstrap"),
+	cmd := exec.CommandContext(
+		ctx,
+		launchCommand,
+		"--print",
+		"--output-format",
+		"text",
+		"--trust",
+		"--workspace",
+		workspacePath,
+		"Trust bootstrap",
 	)
-	cmd := exec.CommandContext(ctx, "bash", "-lc", trustCommand)
 	cmd.Dir = workspacePath
 	if err := cmd.Run(); err != nil {
 		log.Printf("cursor trust bootstrap skipped in %q: %v", workspacePath, err)
@@ -377,6 +532,36 @@ func cursorExecutableFromCommand(launchCommand string) (string, bool) {
 	return first, true
 }
 
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+func ensureCursorChatID(cursorExec, workspacePath string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, cursorExec, "create-chat", "--workspace", workspacePath)
+	cmd.Dir = workspacePath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("cursor create-chat failed: %s", strings.TrimSpace(string(output)))
+	}
+
+	chatID := parseCursorChatID(string(output))
+	if chatID == "" {
+		return "", fmt.Errorf("unable to parse cursor chat id from output: %s", strings.TrimSpace(string(output)))
+	}
+	return chatID, nil
+}
+
+func parseCursorChatID(output string) string {
+	pattern := regexp.MustCompile(`[A-Za-z0-9_-]{8,}`)
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		matches := pattern.FindAllString(line, -1)
+		if len(matches) > 0 {
+			return matches[len(matches)-1]
+		}
+	}
+	return ""
 }

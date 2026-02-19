@@ -16,6 +16,7 @@ GITHUB_REF="${GITHUB_REF:-main}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 TMP_SRC_DIR="/tmp/fj-go-relay-src"
 PAIR_INFO_CMD="/usr/local/bin/fj-go-relay-info"
+SELF_CHECK_CMD="/usr/local/bin/fj-go-relay-self-check"
 
 log() {
   echo "[fj-install] $*" >&2
@@ -324,6 +325,170 @@ EOF
   chmod 755 "${PAIR_INFO_CMD}"
 }
 
+install_self_check_command() {
+  cat >"${SELF_CHECK_CMD}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/fj-go-relay.env"
+SERVICE_NAME="fj-go-relay"
+DEFAULT_REPO_URL="${1:-https://github.com/hooliodevs/fj.git}"
+
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+red() { printf '\033[31m%s\033[0m\n' "$*"; }
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+
+pass() { PASS_COUNT=$((PASS_COUNT + 1)); green "[PASS] $*"; }
+warn() { WARN_COUNT=$((WARN_COUNT + 1)); yellow "[WARN] $*"; }
+fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); red "[FAIL] $*"; }
+
+require_root_if_needed() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    warn "Run as root for full checks. Limited checks will run."
+  fi
+}
+
+check_service() {
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    pass "systemd service '${SERVICE_NAME}' is active"
+  else
+    fail "systemd service '${SERVICE_NAME}' is not active"
+  fi
+}
+
+check_health() {
+  if curl -fsS "http://127.0.0.1:8787/v1/health" >/dev/null; then
+    pass "local health endpoint responds"
+  else
+    fail "local health endpoint failed"
+  fi
+}
+
+check_listener() {
+  if ss -ltnp 2>/dev/null | grep -q ":8787"; then
+    pass "port 8787 is listening"
+  else
+    fail "port 8787 is not listening"
+  fi
+}
+
+check_ufw() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    warn "ufw not installed (skipping firewall rule check)"
+    return
+  fi
+
+  local status
+  status="$(ufw status 2>/dev/null || true)"
+  if echo "${status}" | grep -q "Status: active"; then
+    if echo "${status}" | grep -Eq "8787/tcp\s+ALLOW"; then
+      pass "ufw allows 8787/tcp"
+    else
+      fail "ufw is active but 8787/tcp is not allowed"
+    fi
+  else
+    warn "ufw not active (ensure cloud firewall allows 8787/tcp)"
+  fi
+}
+
+check_env_and_pair() {
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    fail "env file missing at ${ENV_FILE}"
+    return
+  fi
+  pass "env file exists (${ENV_FILE})"
+
+  local server_url pair_code launch_cmd
+  server_url="$(awk -F= '/^SERVER_URL=/{print $2}' "${ENV_FILE}")"
+  pair_code="$(awk -F= '/^PAIR_CODE=/{print $2}' "${ENV_FILE}")"
+  launch_cmd="$(awk -F= '/^DEFAULT_CURSOR_COMMAND=/{print $2}' "${ENV_FILE}")"
+
+  if [[ -n "${server_url}" && -n "${pair_code}" && -n "${launch_cmd}" ]]; then
+    pass "env has SERVER_URL, PAIR_CODE and DEFAULT_CURSOR_COMMAND"
+  else
+    fail "env missing required pairing/runtime values"
+  fi
+
+  if command -v fj-go-relay-info >/dev/null 2>&1; then
+    if fj-go-relay-info >/dev/null 2>&1; then
+      pass "fj-go-relay-info command works"
+    else
+      fail "fj-go-relay-info command failed"
+    fi
+  else
+    fail "fj-go-relay-info command missing"
+  fi
+}
+
+check_cursor_for_service_user() {
+  local launch_cmd
+  launch_cmd="$(awk -F= '/^DEFAULT_CURSOR_COMMAND=/{print $2}' "${ENV_FILE}" 2>/dev/null || true)"
+  if [[ -z "${launch_cmd}" ]]; then
+    fail "DEFAULT_CURSOR_COMMAND not set in env"
+    return
+  fi
+
+  if sudo -u fjrelay -H bash -lc "${launch_cmd} --version" >/dev/null 2>&1; then
+    pass "cursor command executes as fjrelay (${launch_cmd})"
+  else
+    fail "cursor command is not executable by fjrelay (${launch_cmd})"
+    return
+  fi
+
+  local status_output
+  status_output="$(sudo -u fjrelay -H bash -lc "${launch_cmd} status" 2>&1 || true)"
+  if echo "${status_output}" | grep -qi "Not logged in"; then
+    warn "cursor is not logged in for fjrelay (run: sudo -u fjrelay -H bash -lc '${launch_cmd} login')"
+  else
+    pass "cursor appears logged in for fjrelay"
+  fi
+}
+
+check_git_auth() {
+  if sudo -u fjrelay -H bash -lc "GIT_TERMINAL_PROMPT=0 git ls-remote ${DEFAULT_REPO_URL}" >/dev/null 2>&1; then
+    pass "git non-interactive access works for ${DEFAULT_REPO_URL}"
+  else
+    fail "git non-interactive access failed for ${DEFAULT_REPO_URL}"
+  fi
+}
+
+summary() {
+  echo
+  echo "------ fj-go-relay self-check summary ------"
+  echo "PASS: ${PASS_COUNT}"
+  echo "WARN: ${WARN_COUNT}"
+  echo "FAIL: ${FAIL_COUNT}"
+  echo "--------------------------------------------"
+  if [[ "${FAIL_COUNT}" -gt 0 ]]; then
+    exit 1
+  fi
+}
+
+main() {
+  require_root_if_needed
+  check_service
+  check_health
+  check_listener
+  check_ufw
+  check_env_and_pair
+  if [[ "${EUID}" -eq 0 ]]; then
+    check_cursor_for_service_user
+    check_git_auth
+  else
+    warn "Skipping fjrelay user checks (run as root for full validation)"
+  fi
+  summary
+}
+
+main "$@"
+EOF
+  chmod 755 "${SELF_CHECK_CMD}"
+}
+
 print_pairing_info() {
   log "----------------------------------------------------------"
   log "Install complete."
@@ -350,6 +515,8 @@ print_pairing_info() {
   log ""
   log "Reminder command:"
   log "  ${PAIR_INFO_CMD}"
+  log "Self-check command:"
+  log "  ${SELF_CHECK_CMD}"
   log "----------------------------------------------------------"
 }
 
@@ -369,6 +536,7 @@ main() {
   write_env_file
   install_service
   install_pair_info_command
+  install_self_check_command
   print_pairing_info
 }
 

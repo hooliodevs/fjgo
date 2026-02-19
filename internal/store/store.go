@@ -34,6 +34,7 @@ type Session struct {
 	WorkspaceID   string    `json:"workspace_id"`
 	Name          string    `json:"name"`
 	LaunchCommand string    `json:"launch_command"`
+	CursorChatID  string    `json:"cursor_chat_id"`
 	State         string    `json:"state"`
 	LastError     string    `json:"last_error"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -89,6 +90,7 @@ func (s *Store) Init(ctx context.Context) error {
 			workspace_id TEXT NOT NULL,
 			name TEXT NOT NULL,
 			launch_command TEXT NOT NULL,
+			cursor_chat_id TEXT NOT NULL DEFAULT '',
 			state TEXT NOT NULL,
 			last_error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
@@ -115,6 +117,9 @@ func (s *Store) Init(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("run migration statement: %w", err)
 		}
+	}
+	if err := s.ensureColumn(ctx, "sessions", "cursor_chat_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("ensure sessions.cursor_chat_id: %w", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -347,19 +352,21 @@ func (s *Store) CreateSession(ctx context.Context, userID, workspaceID, name, la
 		WorkspaceID:   workspaceID,
 		Name:          name,
 		LaunchCommand: launchCommand,
+		CursorChatID:  "",
 		State:         "idle",
 		CreatedAt:     now,
 		LastActiveAt:  now,
 	}
 	_, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO sessions(id, user_id, workspace_id, name, launch_command, state, created_at, last_active_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions(id, user_id, workspace_id, name, launch_command, cursor_chat_id, state, created_at, last_active_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		session.ID,
 		session.UserID,
 		session.WorkspaceID,
 		session.Name,
 		session.LaunchCommand,
+		session.CursorChatID,
 		session.State,
 		session.CreatedAt.Format(time.RFC3339Nano),
 		session.LastActiveAt.Format(time.RFC3339Nano),
@@ -372,7 +379,7 @@ func (s *Store) SessionByID(ctx context.Context, userID, sessionID string) (Sess
 	var createdAt, lastActiveAt string
 	err := s.db.QueryRowContext(
 		ctx,
-		`SELECT id, user_id, workspace_id, name, launch_command, state, last_error, created_at, last_active_at
+		`SELECT id, user_id, workspace_id, name, launch_command, cursor_chat_id, state, last_error, created_at, last_active_at
 		 FROM sessions
 		 WHERE id = ? AND user_id = ?`,
 		sessionID, userID,
@@ -382,6 +389,7 @@ func (s *Store) SessionByID(ctx context.Context, userID, sessionID string) (Sess
 		&session.WorkspaceID,
 		&session.Name,
 		&session.LaunchCommand,
+		&session.CursorChatID,
 		&session.State,
 		&session.LastError,
 		&createdAt,
@@ -398,7 +406,7 @@ func (s *Store) SessionByID(ctx context.Context, userID, sessionID string) (Sess
 func (s *Store) ListSessions(ctx context.Context, userID string) ([]Session, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT id, user_id, workspace_id, name, launch_command, state, last_error, created_at, last_active_at
+		`SELECT id, user_id, workspace_id, name, launch_command, cursor_chat_id, state, last_error, created_at, last_active_at
 		 FROM sessions
 		 WHERE user_id = ?
 		 ORDER BY last_active_at DESC`,
@@ -419,6 +427,7 @@ func (s *Store) ListSessions(ctx context.Context, userID string) ([]Session, err
 			&session.WorkspaceID,
 			&session.Name,
 			&session.LaunchCommand,
+			&session.CursorChatID,
 			&session.State,
 			&session.LastError,
 			&createdAt,
@@ -451,6 +460,19 @@ func (s *Store) TouchSession(ctx context.Context, sessionID string) error {
 	_, err := s.db.ExecContext(
 		ctx,
 		`UPDATE sessions SET last_active_at = ? WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		sessionID,
+	)
+	return err
+}
+
+func (s *Store) SetSessionCursorChatID(ctx context.Context, sessionID, cursorChatID string) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE sessions
+		 SET cursor_chat_id = ?, last_active_at = ?
+		 WHERE id = ?`,
+		cursorChatID,
 		time.Now().UTC().Format(time.RFC3339Nano),
 		sessionID,
 	)
@@ -532,4 +554,32 @@ func HashToken(raw string) string {
 	// Quick deterministic hash for storage lookups.
 	// Not password storage: token itself is already cryptographically random.
 	return fmt.Sprintf("%x", uuid.NewSHA1(uuid.NameSpaceOID, []byte(raw)))
+}
+
+func (s *Store) ensureColumn(ctx context.Context, tableName, columnName, definition string) error {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, tableName))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == columnName {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, tableName, columnName, definition))
+	return err
 }
