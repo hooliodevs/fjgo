@@ -203,6 +203,21 @@ configure_git_auth() {
   log "Configured GitHub credential helper for ${APP_USER}."
 }
 
+configure_git_identity() {
+  local existing_name
+  existing_name="$(as_app_user git config --global user.name 2>/dev/null || true)"
+  local existing_email
+  existing_email="$(as_app_user git config --global user.email 2>/dev/null || true)"
+  if [[ -z "${existing_name}" ]]; then
+    as_app_user git config --global user.name "FJ Mobile IDE"
+    log "Set git user.name to 'FJ Mobile IDE' for ${APP_USER}."
+  fi
+  if [[ -z "${existing_email}" ]]; then
+    as_app_user git config --global user.email "fjrelay@$(hostname -f 2>/dev/null || echo localhost)"
+    log "Set git user.email for ${APP_USER}."
+  fi
+}
+
 build_binary() {
   local src="${1}"
   log "Building relay binary..."
@@ -558,6 +573,7 @@ main() {
     build_binary "${source_dir}"
   fi
   configure_git_auth
+  configure_git_identity
   cursor_setup_guide
   write_env_file
   install_service

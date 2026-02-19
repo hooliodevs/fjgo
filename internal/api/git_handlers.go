@@ -94,6 +94,8 @@ func (s *Server) handleWorkspaceAction(w http.ResponseWriter, r *http.Request) {
 		s.handleGitCommit(w, r, workspaceID)
 	case action == "push" && r.Method == http.MethodPost:
 		s.handleGitPush(w, r, workspaceID)
+	case action == "pull" && r.Method == http.MethodPost:
+		s.handleGitPull(w, r, workspaceID)
 	case action == "discard" && r.Method == http.MethodPost:
 		s.handleGitDiscard(w, r, workspaceID)
 	case action == "log" && r.Method == http.MethodGet:
@@ -267,6 +269,20 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request, workspace
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "output": out})
 }
 
+func (s *Server) handleGitPull(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	workspace, ok := s.authorizedWorkspace(w, r, workspaceID)
+	if !ok {
+		return
+	}
+
+	out, err := runGit(r.Context(), workspace.LocalPath, "pull", "--ff-only")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "output": out})
+}
+
 func (s *Server) handleGitDiscard(w http.ResponseWriter, r *http.Request, workspaceID string) {
 	workspace, ok := s.authorizedWorkspace(w, r, workspaceID)
 	if !ok {
@@ -284,15 +300,23 @@ func (s *Server) handleGitDiscard(w http.ResponseWriter, r *http.Request, worksp
 		return
 	}
 
-	restoreArgs := append([]string{"restore", "--source=HEAD", "--staged", "--worktree", "--"}, paths...)
-	if _, err := runGit(r.Context(), workspace.LocalPath, restoreArgs...); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+	var hardErrors []string
+	for _, path := range paths {
+		restoreArgs := []string{"restore", "--source=HEAD", "--staged", "--worktree", "--", path}
+		if _, err := runGit(r.Context(), workspace.LocalPath, restoreArgs...); err != nil && !isPathspecNotFoundError(err.Error()) {
+			hardErrors = append(hardErrors, err.Error())
+		}
+
+		// This removes untracked files/directories for the selected path.
+		cleanArgs := []string{"clean", "-fd", "--", path}
+		if _, err := runGit(r.Context(), workspace.LocalPath, cleanArgs...); err != nil && !isPathspecNotFoundError(err.Error()) {
+			hardErrors = append(hardErrors, err.Error())
+		}
+	}
+	if len(hardErrors) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": hardErrors[0]})
 		return
 	}
-
-	// This removes untracked files/directories if the client selected them.
-	cleanArgs := append([]string{"clean", "-fd", "--"}, paths...)
-	_, _ = runGit(r.Context(), workspace.LocalPath, cleanArgs...)
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "paths": paths})
 }
@@ -510,4 +534,10 @@ func runGit(ctx context.Context, workspacePath string, args ...string) (string, 
 		return "", fmt.Errorf("git %s failed: %s", strings.Join(args, " "), output)
 	}
 	return output, nil
+}
+
+func isPathspecNotFoundError(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "did not match any file") ||
+		strings.Contains(msg, "pathspec") && strings.Contains(msg, "did not match")
 }

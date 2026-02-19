@@ -49,6 +49,7 @@ func New(cfg config.Config, s *store.Store, r *runtime.Manager) *Server {
 	mux.HandleFunc("/v1/pair", server.handlePair)
 
 	protected := authMiddleware(server.auth, http.HandlerFunc(server.routeAuthed))
+	mux.Handle("/v1/server/pairing", protected)
 	mux.Handle("/v1/workspaces", protected)
 	mux.Handle("/v1/workspaces/clone", protected)
 	mux.Handle("/v1/workspaces/", protected)
@@ -145,6 +146,8 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) routeAuthed(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == "/v1/server/pairing" && r.Method == http.MethodGet:
+		s.handleServerPairing(w, r)
 	case r.URL.Path == "/v1/workspaces" && r.Method == http.MethodGet:
 		s.handleListWorkspaces(w, r)
 	case r.URL.Path == "/v1/workspaces/clone" && r.Method == http.MethodPost:
@@ -160,6 +163,18 @@ func (s *Server) routeAuthed(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 	}
+}
+
+func (s *Server) handleServerPairing(w http.ResponseWriter, r *http.Request) {
+	pairCode, expiresAt, err := s.store.PairCodeMeta(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to load pairing metadata"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pair_code":            pairCode,
+		"pair_code_expires_at": expiresAt,
+	})
 }
 
 type cloneWorkspaceRequest struct {
