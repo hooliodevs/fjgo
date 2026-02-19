@@ -17,7 +17,7 @@ TMP_SRC_DIR="/tmp/fj-go-relay-src"
 PAIR_INFO_CMD="/usr/local/bin/fj-go-relay-info"
 
 log() {
-  echo "[fj-install] $*"
+  echo "[fj-install] $*" >&2
 }
 
 as_app_user() {
@@ -176,7 +176,7 @@ configure_git_auth() {
   chmod 600 "${creds_file}"
 
   as_app_user git config --global credential.helper "store --file ${creds_file}"
-  as_app_user git config --global credential.useHttpPath true
+  as_app_user git config --global credential.useHttpPath false
   as_app_user git config --global url."https://github.com/".insteadOf "git@github.com:"
   as_app_user git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
   as_app_user git config --global advice.detachedHead false || true
@@ -213,8 +213,10 @@ write_env_file() {
     server_ip="127.0.0.1"
   fi
 
+  local pair_hex
+  pair_hex="$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]')"
   local pair_code
-  pair_code="$(tr -dc 'A-F0-9' </dev/urandom | head -c 6 | sed 's/.../&-/')"
+  pair_code="${pair_hex:0:3}-${pair_hex:3:3}"
 
   cat >"${ENV_FILE}" <<EOF
 HOST=0.0.0.0
