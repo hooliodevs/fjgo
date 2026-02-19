@@ -1,0 +1,17 @@
+[Unit]
+Description=FJ Mobile IDE Go Relay
+After=network.target
+
+[Service]
+Type=simple
+User=fjrelay
+Group=fjrelay
+EnvironmentFile=/etc/fj-go-relay.env
+WorkingDirectory=/opt/fj-go-relay
+ExecStart=/opt/fj-go-relay/fj-go-relay
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

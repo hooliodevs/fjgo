@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="fj-go-relay"
+APP_USER="fjrelay"
+APP_HOME="/opt/${APP_NAME}"
+DATA_DIR="/var/lib/${APP_NAME}"
+ENV_FILE="/etc/${APP_NAME}.env"
+SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
+RELAY_BINARY_URL="${RELAY_BINARY_URL:-}"
+SOURCE_DIR="${SOURCE_DIR:-}"
+CURSOR_LAUNCH_COMMAND="${CURSOR_LAUNCH_COMMAND:-cursor}"
+
+log() {
+  echo "[fj-install] $*"
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run as root (sudo)." >&2
+    exit 1
+  fi
+}
+
+install_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    log "Installing dependencies via apt-get..."
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      ca-certificates curl git sqlite3 jq build-essential
+  elif command -v dnf >/dev/null 2>&1; then
+    log "Installing dependencies via dnf..."
+    dnf install -y ca-certificates curl git sqlite sqlite jq gcc
+  else
+    log "Unsupported package manager. Install curl/git/sqlite3/build tools manually."
+    exit 1
+  fi
+}
+
+install_go_if_missing() {
+  if command -v go >/dev/null 2>&1; then
+    log "Go already installed: $(go version)"
+    return
+  fi
+
+  local arch
+  arch="$(uname -m)"
+  local go_arch="amd64"
+  if [[ "${arch}" == "aarch64" || "${arch}" == "arm64" ]]; then
+    go_arch="arm64"
+  fi
+
+  local version="1.22.12"
+  local tarball="go${version}.linux-${go_arch}.tar.gz"
+  local tmp="/tmp/${tarball}"
+  log "Installing Go ${version} (${go_arch})..."
+  curl -fsSL "https://go.dev/dl/${tarball}" -o "${tmp}"
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "${tmp}"
+  ln -sf /usr/local/go/bin/go /usr/local/bin/go
+  log "Installed: $(go version)"
+}
+
+ensure_user_and_paths() {
+  id -u "${APP_USER}" >/dev/null 2>&1 || useradd --system --home "${APP_HOME}" --create-home --shell /usr/sbin/nologin "${APP_USER}"
+  mkdir -p "${APP_HOME}" "${DATA_DIR}" "${DATA_DIR}/workspaces"
+  chown -R "${APP_USER}:${APP_USER}" "${APP_HOME}" "${DATA_DIR}"
+}
+
+prepare_source() {
+  local src="${1:-}"
+  if [[ -z "${src}" && -n "${SOURCE_DIR}" ]]; then
+    src="${SOURCE_DIR}"
+  fi
+  if [[ -z "${src}" ]]; then
+    local this_dir
+    this_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local local_repo
+    local_repo="$(cd "${this_dir}/.." && pwd)"
+    if [[ -f "${local_repo}/go.mod" ]]; then
+      src="$(cd "${local_repo}/.." && pwd)"
+    fi
+  fi
+
+  if [[ -z "${src}" || ! -f "${src}/fj_go_server/go.mod" ]]; then
+    echo "Source not found. Pass SOURCE_DIR=/path/to/repo or provide RELAY_BINARY_URL." >&2
+    exit 1
+  fi
+  echo "${src}"
+}
+
+install_prebuilt_binary() {
+  if [[ -z "${RELAY_BINARY_URL}" ]]; then
+    return 1
+  fi
+  log "Downloading relay binary..."
+  curl -fsSL "${RELAY_BINARY_URL}" -o "${APP_HOME}/fj-go-relay"
+  chmod +x "${APP_HOME}/fj-go-relay"
+  chown "${APP_USER}:${APP_USER}" "${APP_HOME}/fj-go-relay"
+  return 0
+}
+
+build_binary() {
+  local src="${1}"
+  log "Building relay binary..."
+  pushd "${src}/fj_go_server" >/dev/null
+  go mod tidy
+  CGO_ENABLED=1 go build -o "${APP_HOME}/fj-go-relay" ./cmd/server
+  popd >/dev/null
+  chown "${APP_USER}:${APP_USER}" "${APP_HOME}/fj-go-relay"
+  chmod +x "${APP_HOME}/fj-go-relay"
+}
+
+cursor_setup_guide() {
+  log "Cursor CLI check..."
+  if command -v cursor >/dev/null 2>&1; then
+    log "Cursor CLI found: $(cursor --version || true)"
+  else
+    log "Cursor CLI not detected."
+    log "Install Cursor CLI before first session usage and ensure 'cursor' is on PATH for ${APP_USER}."
+    log "After install, authenticate with your normal flow on server:"
+    log "  cursor login   (or your existing auth command)"
+  fi
+}
+
+write_env_file() {
+  local server_ip
+  server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [[ -z "${server_ip}" ]]; then
+    server_ip="127.0.0.1"
+  fi
+
+  local pair_code
+  pair_code="$(tr -dc 'A-F0-9' </dev/urandom | head -c 6 | sed 's/.../&-/')"
+
+  cat >"${ENV_FILE}" <<EOF
+HOST=0.0.0.0
+PORT=8787
+DATABASE_PATH=${DATA_DIR}/fj_relay.db
+WORKSPACES_ROOT=${DATA_DIR}/workspaces
+DEFAULT_CURSOR_COMMAND=${CURSOR_LAUNCH_COMMAND}
+PAIR_CODE=${pair_code}
+PAIR_CODE_TTL_MINUTES=43200
+SERVER_URL=http://${server_ip}:8787
+EOF
+  chmod 600 "${ENV_FILE}"
+}
+
+install_service() {
+  cat >"${SERVICE_FILE}" <<'EOF'
+[Unit]
+Description=FJ Mobile IDE Go Relay
+After=network.target
+
+[Service]
+Type=simple
+User=fjrelay
+Group=fjrelay
+EnvironmentFile=/etc/fj-go-relay.env
+WorkingDirectory=/opt/fj-go-relay
+ExecStart=/opt/fj-go-relay/fj-go-relay
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "${APP_NAME}"
+}
+
+print_pairing_info() {
+  log "----------------------------------------------------------"
+  log "Install complete."
+  log "Service: ${APP_NAME}"
+  log "Status: $(systemctl is-active "${APP_NAME}")"
+  log ""
+  log "Use this in FJ Mobile IDE app onboarding:"
+  awk -F= '
+    /^SERVER_URL=/ {print "Server URL: " $2}
+    /^PAIR_CODE=/ {print "Pair Code: " $2}
+    /^DEFAULT_CURSOR_COMMAND=/ {print "Launch Command: " $2}
+  ' "${ENV_FILE}"
+  echo "Pairing payload JSON:"
+  awk -F= '
+    /^SERVER_URL=/ {server=$2}
+    /^PAIR_CODE=/ {code=$2}
+    END {printf("{\"server_url\":\"%s\",\"pair_code\":\"%s\"}\n", server, code)}
+  ' "${ENV_FILE}"
+  log ""
+  log "Cursor authentication guide:"
+  log "1) Switch to service user shell: sudo -u ${APP_USER} -H bash"
+  log "2) Run Cursor auth command you already use (e.g., cursor login)."
+  log "3) Verify CLI command works before starting sessions from mobile app."
+  log "----------------------------------------------------------"
+}
+
+main() {
+  require_root
+  install_packages
+  ensure_user_and_paths
+  if ! install_prebuilt_binary; then
+    install_go_if_missing
+    local source_dir
+    source_dir="$(prepare_source "${1:-}")"
+    build_binary "${source_dir}"
+  fi
+  cursor_setup_guide
+  write_env_file
+  install_service
+  print_pairing_info
+}
+
+main "$@"

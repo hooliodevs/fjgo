@@ -1,0 +1,535 @@
+package store
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+const defaultUserID = "local-user"
+
+type Store struct {
+	db *sql.DB
+}
+
+type Workspace struct {
+	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`
+	Name      string    `json:"name"`
+	RepoURL   string    `json:"repo_url"`
+	LocalPath string    `json:"local_path"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type Session struct {
+	ID            string    `json:"id"`
+	UserID        string    `json:"user_id"`
+	WorkspaceID   string    `json:"workspace_id"`
+	Name          string    `json:"name"`
+	LaunchCommand string    `json:"launch_command"`
+	State         string    `json:"state"`
+	LastError     string    `json:"last_error"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastActiveAt  time.Time `json:"last_active_at"`
+}
+
+type Message struct {
+	ID        string    `json:"id"`
+	SessionID string    `json:"session_id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func New(db *sql.DB) *Store {
+	return &Store{db: db}
+}
+
+func (s *Store) Init(ctx context.Context) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS devices (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			device_name TEXT NOT NULL,
+			token_hash TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		);`,
+		`CREATE TABLE IF NOT EXISTS workspaces (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			repo_url TEXT NOT NULL,
+			local_path TEXT NOT NULL UNIQUE,
+			status TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		);`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			launch_command TEXT NOT NULL,
+			state TEXT NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			last_active_at TEXT NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+		);`,
+		`CREATE TABLE IF NOT EXISTS messages (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_workspaces_user ON workspaces(user_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_devices_token_hash ON devices(token_hash);`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("run migration statement: %w", err)
+		}
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO users(id, name, created_at) VALUES(?, ?, ?)`,
+		defaultUserID, "Primary User", now,
+	)
+	if err != nil {
+		return fmt.Errorf("ensure default user: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UpsertSetting(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO settings(key, value, updated_at)
+		 VALUES(?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		key,
+		value,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func (s *Store) Setting(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return value, err
+}
+
+func (s *Store) EnsureServerID(ctx context.Context) (string, error) {
+	existing, err := s.Setting(ctx, "server_id")
+	if err != nil {
+		return "", err
+	}
+	if existing != "" {
+		return existing, nil
+	}
+
+	id := "srv_" + uuid.NewString()
+	if err := s.UpsertSetting(ctx, "server_id", id); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (s *Store) SetPairCode(ctx context.Context, code string, expiresAt time.Time) error {
+	if err := s.UpsertSetting(ctx, "pair_code", code); err != nil {
+		return err
+	}
+	return s.UpsertSetting(ctx, "pair_code_expires_at", expiresAt.UTC().Format(time.RFC3339Nano))
+}
+
+func (s *Store) ValidatePairCode(ctx context.Context, code string) (bool, error) {
+	currentCode, err := s.Setting(ctx, "pair_code")
+	if err != nil {
+		return false, err
+	}
+	if currentCode == "" || code != currentCode {
+		return false, nil
+	}
+
+	expiresRaw, err := s.Setting(ctx, "pair_code_expires_at")
+	if err != nil {
+		return false, err
+	}
+	if expiresRaw == "" {
+		return false, nil
+	}
+
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresRaw)
+	if err != nil {
+		return false, nil
+	}
+	return time.Now().UTC().Before(expiresAt), nil
+}
+
+func (s *Store) PairCodeMeta(ctx context.Context) (string, time.Time, error) {
+	code, err := s.Setting(ctx, "pair_code")
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expiresRaw, err := s.Setting(ctx, "pair_code_expires_at")
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if expiresRaw == "" {
+		return code, time.Time{}, nil
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresRaw)
+	if err != nil {
+		return code, time.Time{}, nil
+	}
+	return code, expiresAt, nil
+}
+
+func (s *Store) CreateDevice(ctx context.Context, name, tokenHash string) (string, error) {
+	deviceID := uuid.NewString()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO devices(id, user_id, device_name, token_hash, created_at, last_seen_at)
+		 VALUES(?, ?, ?, ?, ?, ?)`,
+		deviceID, defaultUserID, name, tokenHash, now, now,
+	)
+	if err != nil {
+		return "", err
+	}
+	return deviceID, nil
+}
+
+func (s *Store) UserIDByTokenHash(ctx context.Context, tokenHash string) (string, error) {
+	var userID string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT user_id FROM devices WHERE token_hash = ?`,
+		tokenHash,
+	).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+
+	_, _ = s.db.ExecContext(
+		ctx,
+		`UPDATE devices SET last_seen_at = ? WHERE token_hash = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		tokenHash,
+	)
+	return userID, nil
+}
+
+func (s *Store) CreateWorkspace(ctx context.Context, userID, name, repoURL, localPath string) (Workspace, error) {
+	workspace := Workspace{
+		ID:        uuid.NewString(),
+		UserID:    userID,
+		Name:      name,
+		RepoURL:   repoURL,
+		LocalPath: localPath,
+		Status:    "ready",
+		CreatedAt: time.Now().UTC(),
+	}
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO workspaces(id, user_id, name, repo_url, local_path, status, created_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		workspace.ID,
+		workspace.UserID,
+		workspace.Name,
+		workspace.RepoURL,
+		workspace.LocalPath,
+		workspace.Status,
+		workspace.CreatedAt.Format(time.RFC3339Nano),
+	)
+	return workspace, err
+}
+
+func (s *Store) ListWorkspaces(ctx context.Context, userID string) ([]Workspace, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, user_id, name, repo_url, local_path, status, created_at
+		 FROM workspaces
+		 WHERE user_id = ?
+		 ORDER BY created_at DESC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var workspaces []Workspace
+	for rows.Next() {
+		var workspace Workspace
+		var createdAt string
+		if err := rows.Scan(
+			&workspace.ID,
+			&workspace.UserID,
+			&workspace.Name,
+			&workspace.RepoURL,
+			&workspace.LocalPath,
+			&workspace.Status,
+			&createdAt,
+		); err != nil {
+			return nil, err
+		}
+		workspace.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		workspaces = append(workspaces, workspace)
+	}
+	return workspaces, rows.Err()
+}
+
+func (s *Store) WorkspaceByID(ctx context.Context, userID, workspaceID string) (Workspace, error) {
+	var workspace Workspace
+	var createdAt string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, user_id, name, repo_url, local_path, status, created_at
+		 FROM workspaces
+		 WHERE id = ? AND user_id = ?`,
+		workspaceID, userID,
+	).Scan(
+		&workspace.ID,
+		&workspace.UserID,
+		&workspace.Name,
+		&workspace.RepoURL,
+		&workspace.LocalPath,
+		&workspace.Status,
+		&createdAt,
+	)
+	if err != nil {
+		return Workspace{}, err
+	}
+	workspace.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	return workspace, nil
+}
+
+func (s *Store) CreateSession(ctx context.Context, userID, workspaceID, name, launchCommand string) (Session, error) {
+	now := time.Now().UTC()
+	session := Session{
+		ID:            uuid.NewString(),
+		UserID:        userID,
+		WorkspaceID:   workspaceID,
+		Name:          name,
+		LaunchCommand: launchCommand,
+		State:         "idle",
+		CreatedAt:     now,
+		LastActiveAt:  now,
+	}
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO sessions(id, user_id, workspace_id, name, launch_command, state, created_at, last_active_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		session.ID,
+		session.UserID,
+		session.WorkspaceID,
+		session.Name,
+		session.LaunchCommand,
+		session.State,
+		session.CreatedAt.Format(time.RFC3339Nano),
+		session.LastActiveAt.Format(time.RFC3339Nano),
+	)
+	return session, err
+}
+
+func (s *Store) SessionByID(ctx context.Context, userID, sessionID string) (Session, error) {
+	var session Session
+	var createdAt, lastActiveAt string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, user_id, workspace_id, name, launch_command, state, last_error, created_at, last_active_at
+		 FROM sessions
+		 WHERE id = ? AND user_id = ?`,
+		sessionID, userID,
+	).Scan(
+		&session.ID,
+		&session.UserID,
+		&session.WorkspaceID,
+		&session.Name,
+		&session.LaunchCommand,
+		&session.State,
+		&session.LastError,
+		&createdAt,
+		&lastActiveAt,
+	)
+	if err != nil {
+		return Session{}, err
+	}
+	session.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	session.LastActiveAt, _ = time.Parse(time.RFC3339Nano, lastActiveAt)
+	return session, nil
+}
+
+func (s *Store) ListSessions(ctx context.Context, userID string) ([]Session, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, user_id, workspace_id, name, launch_command, state, last_error, created_at, last_active_at
+		 FROM sessions
+		 WHERE user_id = ?
+		 ORDER BY last_active_at DESC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var session Session
+		var createdAt, lastActiveAt string
+		if err := rows.Scan(
+			&session.ID,
+			&session.UserID,
+			&session.WorkspaceID,
+			&session.Name,
+			&session.LaunchCommand,
+			&session.State,
+			&session.LastError,
+			&createdAt,
+			&lastActiveAt,
+		); err != nil {
+			return nil, err
+		}
+		session.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		session.LastActiveAt, _ = time.Parse(time.RFC3339Nano, lastActiveAt)
+		sessions = append(sessions, session)
+	}
+	return sessions, rows.Err()
+}
+
+func (s *Store) UpdateSessionState(ctx context.Context, sessionID, state, lastError string) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE sessions
+		 SET state = ?, last_error = ?, last_active_at = ?
+		 WHERE id = ?`,
+		state,
+		lastError,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		sessionID,
+	)
+	return err
+}
+
+func (s *Store) TouchSession(ctx context.Context, sessionID string) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE sessions SET last_active_at = ? WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		sessionID,
+	)
+	return err
+}
+
+func (s *Store) AddMessage(ctx context.Context, sessionID, role, content string) (Message, error) {
+	message := Message{
+		ID:        uuid.NewString(),
+		SessionID: sessionID,
+		Role:      role,
+		Content:   content,
+		CreatedAt: time.Now().UTC(),
+	}
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO messages(id, session_id, role, content, created_at)
+		 VALUES(?, ?, ?, ?, ?)`,
+		message.ID,
+		message.SessionID,
+		message.Role,
+		message.Content,
+		message.CreatedAt.Format(time.RFC3339Nano),
+	)
+	return message, err
+}
+
+func (s *Store) ListMessages(ctx context.Context, userID, sessionID string, limit int) ([]Message, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT m.id, m.session_id, m.role, m.content, m.created_at
+		 FROM messages m
+		 JOIN sessions s ON s.id = m.session_id
+		 WHERE m.session_id = ? AND s.user_id = ?
+		 ORDER BY m.created_at ASC
+		 LIMIT ?`,
+		sessionID,
+		userID,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []Message
+	for rows.Next() {
+		var message Message
+		var createdAt string
+		if err := rows.Scan(
+			&message.ID,
+			&message.SessionID,
+			&message.Role,
+			&message.Content,
+			&createdAt,
+		); err != nil {
+			return nil, err
+		}
+		message.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
+}
+
+func (s *Store) NewPairToken() (rawToken, tokenHash string, err error) {
+	buf := make([]byte, 32)
+	if _, err = rand.Read(buf); err != nil {
+		return "", "", err
+	}
+	rawToken = hex.EncodeToString(buf)
+	tokenHash = HashToken(rawToken)
+	return rawToken, tokenHash, nil
+}
+
+func HashToken(raw string) string {
+	// Quick deterministic hash for storage lookups.
+	// Not password storage: token itself is already cryptographically random.
+	return fmt.Sprintf("%x", uuid.NewSHA1(uuid.NameSpaceOID, []byte(raw)))
+}
