@@ -319,7 +319,14 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now "${APP_NAME}"
+  systemctl enable "${APP_NAME}"
+  if systemctl is-active --quiet "${APP_NAME}"; then
+    log "Service is already running; restarting to apply updates..."
+    systemctl restart "${APP_NAME}"
+  else
+    log "Starting service..."
+    systemctl start "${APP_NAME}"
+  fi
 }
 
 install_pair_info_command() {
