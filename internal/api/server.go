@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -193,6 +194,7 @@ func (s *Server) handleCloneWorkspace(w http.ResponseWriter, r *http.Request) {
 	cloneOut, cloneErr := cloneCmd.CombinedOutput()
 	if cloneErr != nil {
 		_ = os.RemoveAll(localPath)
+		log.Printf("clone failed repo=%q path=%q err=%v output=%s", req.RepoURL, localPath, cloneErr, string(cloneOut))
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":  "git clone failed",
 			"detail": string(cloneOut),
