@@ -249,7 +249,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		req.LaunchCommand = s.cfg.DefaultCursorCommand
 	}
 	if req.Model == "" {
-		req.Model = "gemini-flash-3"
+		req.Model = "gemini-3-flash"
 	}
 
 	userID := auth.UserID(r.Context())

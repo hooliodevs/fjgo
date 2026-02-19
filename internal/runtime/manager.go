@@ -200,7 +200,7 @@ func (rt *SessionRuntime) startCursorMode(cursorExec string) error {
 	rt.chatID = chatID
 	rt.model = strings.TrimSpace(rt.session.CursorModel)
 	if rt.model == "" {
-		rt.model = "gemini-flash-3"
+		rt.model = "gemini-3-flash"
 	}
 	rt.inputs = make(chan string, 64)
 	go rt.cursorWorker()
@@ -220,7 +220,7 @@ func (rt *SessionRuntime) runCursorPrompt(prompt string) {
 	model := rt.model
 	rt.mu.Unlock()
 	if strings.TrimSpace(model) == "" {
-		model = "gemini-flash-3"
+		model = "gemini-3-flash"
 	}
 
 	cmd := exec.CommandContext(

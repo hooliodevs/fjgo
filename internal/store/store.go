@@ -93,7 +93,7 @@ func (s *Store) Init(ctx context.Context) error {
 			name TEXT NOT NULL,
 			launch_command TEXT NOT NULL,
 			cursor_chat_id TEXT NOT NULL DEFAULT '',
-			cursor_model TEXT NOT NULL DEFAULT 'gemini-flash-3',
+			cursor_model TEXT NOT NULL DEFAULT 'gemini-3-flash',
 			state TEXT NOT NULL,
 			last_error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
@@ -124,7 +124,7 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "sessions", "cursor_chat_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("ensure sessions.cursor_chat_id: %w", err)
 	}
-	if err := s.ensureColumn(ctx, "sessions", "cursor_model", "TEXT NOT NULL DEFAULT 'gemini-flash-3'"); err != nil {
+	if err := s.ensureColumn(ctx, "sessions", "cursor_model", "TEXT NOT NULL DEFAULT 'gemini-3-flash'"); err != nil {
 		return fmt.Errorf("ensure sessions.cursor_model: %w", err)
 	}
 
@@ -353,7 +353,7 @@ func (s *Store) WorkspaceByID(ctx context.Context, userID, workspaceID string) (
 func (s *Store) CreateSession(ctx context.Context, userID, workspaceID, name, launchCommand, cursorModel string) (Session, error) {
 	now := time.Now().UTC()
 	if strings.TrimSpace(cursorModel) == "" {
-		cursorModel = "gemini-flash-3"
+		cursorModel = "gemini-3-flash"
 	}
 	session := Session{
 		ID:            uuid.NewString(),
