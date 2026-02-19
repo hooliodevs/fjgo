@@ -10,6 +10,7 @@ SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 RELAY_BINARY_URL="${RELAY_BINARY_URL:-}"
 SOURCE_DIR="${SOURCE_DIR:-}"
 CURSOR_LAUNCH_COMMAND="${CURSOR_LAUNCH_COMMAND:-cursor}"
+EFFECTIVE_CURSOR_COMMAND="${CURSOR_LAUNCH_COMMAND}"
 GITHUB_REPO="${GITHUB_REPO:-hooliodevs/fjgo}"
 GITHUB_REF="${GITHUB_REF:-main}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
@@ -196,13 +197,59 @@ build_binary() {
 
 cursor_setup_guide() {
   log "Cursor CLI check..."
-  if command -v cursor >/dev/null 2>&1; then
-    log "Cursor CLI found: $(cursor --version || true)"
-  else
+
+  if [[ "${CURSOR_LAUNCH_COMMAND}" != "cursor" ]]; then
+    EFFECTIVE_CURSOR_COMMAND="${CURSOR_LAUNCH_COMMAND}"
+    if as_app_user bash -lc "${EFFECTIVE_CURSOR_COMMAND} --version" >/dev/null 2>&1; then
+      log "Using configured cursor launch command: ${EFFECTIVE_CURSOR_COMMAND}"
+      return
+    fi
+    log "Configured CURSOR_LAUNCH_COMMAND is not executable by ${APP_USER}: ${EFFECTIVE_CURSOR_COMMAND}"
+    return
+  fi
+
+  if ! command -v cursor >/dev/null 2>&1; then
     log "Cursor CLI not detected."
     log "Install Cursor CLI before first session usage and ensure 'cursor' is on PATH for ${APP_USER}."
     log "After install, authenticate with your normal flow on server:"
     log "  cursor login   (or your existing auth command)"
+    return
+  fi
+
+  local cursor_bin
+  cursor_bin="$(command -v cursor)"
+  local cursor_real
+  cursor_real="$(readlink -f "${cursor_bin}" 2>/dev/null || true)"
+  if [[ -z "${cursor_real}" ]]; then
+    cursor_real="${cursor_bin}"
+  fi
+
+  if as_app_user bash -lc "${cursor_real} --version" >/dev/null 2>&1; then
+    EFFECTIVE_CURSOR_COMMAND="${cursor_real}"
+    log "Cursor CLI available for ${APP_USER}: ${EFFECTIVE_CURSOR_COMMAND}"
+  else
+    log "Cursor binary is not executable by ${APP_USER}; installing shared runtime bundle..."
+    local runtime_src
+    runtime_src="$(dirname "${cursor_real}")"
+    mkdir -p "${APP_HOME}/cursor-runtime" "${APP_HOME}/bin"
+    cp -a "${runtime_src}/." "${APP_HOME}/cursor-runtime/"
+    ln -sf "${APP_HOME}/cursor-runtime/cursor-agent" "${APP_HOME}/bin/cursor"
+    chown -R "${APP_USER}:${APP_USER}" "${APP_HOME}/cursor-runtime" "${APP_HOME}/bin"
+    chmod -R a+rX "${APP_HOME}/cursor-runtime"
+    chmod 755 "${APP_HOME}/bin/cursor"
+
+    EFFECTIVE_CURSOR_COMMAND="${APP_HOME}/bin/cursor"
+    if as_app_user bash -lc "${EFFECTIVE_CURSOR_COMMAND} --version" >/dev/null 2>&1; then
+      log "Cursor runtime prepared for ${APP_USER}: ${EFFECTIVE_CURSOR_COMMAND}"
+    else
+      log "Cursor runtime still unavailable for ${APP_USER}; manual fix required."
+      return
+    fi
+  fi
+
+  if as_app_user bash -lc "${EFFECTIVE_CURSOR_COMMAND} status" 2>/dev/null | grep -qi "Not logged in"; then
+    log "Cursor is not logged in for ${APP_USER}. Run:"
+    log "  sudo -u ${APP_USER} -H bash -lc '${EFFECTIVE_CURSOR_COMMAND} login'"
   fi
 }
 
@@ -223,7 +270,7 @@ HOST=0.0.0.0
 PORT=8787
 DATABASE_PATH=${DATA_DIR}/fj_relay.db
 WORKSPACES_ROOT=${DATA_DIR}/workspaces
-DEFAULT_CURSOR_COMMAND=${CURSOR_LAUNCH_COMMAND}
+DEFAULT_CURSOR_COMMAND=${EFFECTIVE_CURSOR_COMMAND}
 PAIR_CODE=${pair_code}
 PAIR_CODE_TTL_MINUTES=43200
 SERVER_URL=http://${server_ip}:8787
