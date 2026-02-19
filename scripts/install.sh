@@ -10,6 +10,10 @@ SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 RELAY_BINARY_URL="${RELAY_BINARY_URL:-}"
 SOURCE_DIR="${SOURCE_DIR:-}"
 CURSOR_LAUNCH_COMMAND="${CURSOR_LAUNCH_COMMAND:-cursor}"
+GITHUB_REPO="${GITHUB_REPO:-hooliodevs/fjgo}"
+GITHUB_REF="${GITHUB_REF:-main}"
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+TMP_SRC_DIR="/tmp/fj-go-relay-src"
 
 log() {
   echo "[fj-install] $*"
@@ -73,20 +77,37 @@ prepare_source() {
     src="${SOURCE_DIR}"
   fi
   if [[ -z "${src}" ]]; then
-    local this_dir
-    this_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local local_repo
-    local_repo="$(cd "${this_dir}/.." && pwd)"
-    if [[ -f "${local_repo}/go.mod" ]]; then
-      src="$(cd "${local_repo}/.." && pwd)"
-    fi
+    src="$(download_repo_source)"
   fi
 
   if [[ -z "${src}" || ! -f "${src}/fj_go_server/go.mod" ]]; then
-    echo "Source not found. Pass SOURCE_DIR=/path/to/repo or provide RELAY_BINARY_URL." >&2
+    echo "Source not found. Pass SOURCE_DIR=/path/to/repo or configure GITHUB_REPO/GITHUB_REF." >&2
     exit 1
   fi
   echo "${src}"
+}
+
+download_repo_source() {
+  rm -rf "${TMP_SRC_DIR}"
+  mkdir -p "${TMP_SRC_DIR}"
+
+  local archive_path="${TMP_SRC_DIR}/repo.tar.gz"
+  local github_url
+  github_url="https://api.github.com/repos/${GITHUB_REPO}/tarball/${GITHUB_REF}"
+
+  log "Downloading source archive from ${GITHUB_REPO}@${GITHUB_REF}..."
+  if [[ -n "${GITHUB_TOKEN}" ]]; then
+    curl -fsSL \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "${github_url}" -o "${archive_path}"
+  else
+    curl -fsSL "${github_url}" -o "${archive_path}"
+  fi
+
+  mkdir -p "${TMP_SRC_DIR}/src"
+  tar -xzf "${archive_path}" -C "${TMP_SRC_DIR}/src" --strip-components=1
+  echo "${TMP_SRC_DIR}/src"
 }
 
 install_prebuilt_binary() {
@@ -94,7 +115,13 @@ install_prebuilt_binary() {
     return 1
   fi
   log "Downloading relay binary..."
-  curl -fsSL "${RELAY_BINARY_URL}" -o "${APP_HOME}/fj-go-relay"
+  if [[ -n "${GITHUB_TOKEN}" ]]; then
+    curl -fsSL \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      "${RELAY_BINARY_URL}" -o "${APP_HOME}/fj-go-relay"
+  else
+    curl -fsSL "${RELAY_BINARY_URL}" -o "${APP_HOME}/fj-go-relay"
+  fi
   chmod +x "${APP_HOME}/fj-go-relay"
   chown "${APP_USER}:${APP_USER}" "${APP_HOME}/fj-go-relay"
   return 0
