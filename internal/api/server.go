@@ -148,6 +148,8 @@ func (s *Server) routeAuthed(w http.ResponseWriter, r *http.Request) {
 		s.handleListWorkspaces(w, r)
 	case r.URL.Path == "/v1/workspaces/clone" && r.Method == http.MethodPost:
 		s.handleCloneWorkspace(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/workspaces/"):
+		s.handleWorkspaceAction(w, r)
 	case r.URL.Path == "/v1/sessions" && r.Method == http.MethodGet:
 		s.handleListSessions(w, r)
 	case r.URL.Path == "/v1/sessions" && r.Method == http.MethodPost:
@@ -382,7 +384,7 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sess
 		return
 	}
 
-	_, err = s.store.AddMessage(r.Context(), sessionID, "user", req.Content)
+	_, err = s.store.AddMessage(r.Context(), sessionID, "user", req.Content, "")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to persist input"})
 		return

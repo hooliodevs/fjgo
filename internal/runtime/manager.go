@@ -266,7 +266,7 @@ func (rt *SessionRuntime) runCursorPrompt(prompt string) {
 		content = "(No response text returned by Cursor)"
 	}
 
-	_, _ = rt.store.AddMessage(context.Background(), rt.session.ID, "assistant", content)
+	_, _ = rt.store.AddMessage(context.Background(), rt.session.ID, "assistant", content, model)
 	_ = rt.store.UpdateSessionState(context.Background(), rt.session.ID, "active", "")
 	_ = rt.store.TouchSession(context.Background(), rt.session.ID)
 	rt.broadcast(Event{
@@ -363,7 +363,7 @@ func (rt *SessionRuntime) flushPendingOutput() {
 	if content == "" {
 		return
 	}
-	_, _ = rt.store.AddMessage(context.Background(), rt.session.ID, "assistant", content)
+	_, _ = rt.store.AddMessage(context.Background(), rt.session.ID, "assistant", content, "")
 }
 
 func (rt *SessionRuntime) cleanup() {

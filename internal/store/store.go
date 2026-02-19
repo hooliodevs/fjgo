@@ -43,13 +43,14 @@ type Session struct {
 	LastActiveAt  time.Time `json:"last_active_at"`
 }
 
-type Message struct {
-	ID        string    `json:"id"`
-	SessionID string    `json:"session_id"`
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"created_at"`
-}
+type 	Message struct {
+		ID        string    `json:"id"`
+		SessionID string    `json:"session_id"`
+		Role      string    `json:"role"`
+		Content   string    `json:"content"`
+		Model     string    `json:"model"`
+		CreatedAt time.Time `json:"created_at"`
+	}
 
 func New(db *sql.DB) *Store {
 	return &Store{db: db}
@@ -106,6 +107,7 @@ func (s *Store) Init(ctx context.Context) error {
 			session_id TEXT NOT NULL,
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);`,
@@ -126,6 +128,9 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "sessions", "cursor_model", "TEXT NOT NULL DEFAULT 'gemini-3-flash'"); err != nil {
 		return fmt.Errorf("ensure sessions.cursor_model: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "messages", "model", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("ensure messages.model: %w", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -505,22 +510,24 @@ func (s *Store) SetSessionModel(ctx context.Context, sessionID, cursorModel stri
 	return err
 }
 
-func (s *Store) AddMessage(ctx context.Context, sessionID, role, content string) (Message, error) {
+func (s *Store) AddMessage(ctx context.Context, sessionID, role, content, model string) (Message, error) {
 	message := Message{
 		ID:        uuid.NewString(),
 		SessionID: sessionID,
 		Role:      role,
 		Content:   content,
+		Model:     model,
 		CreatedAt: time.Now().UTC(),
 	}
 	_, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO messages(id, session_id, role, content, created_at)
-		 VALUES(?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(id, session_id, role, content, model, created_at)
+		 VALUES(?, ?, ?, ?, ?, ?)`,
 		message.ID,
 		message.SessionID,
 		message.Role,
 		message.Content,
+		message.Model,
 		message.CreatedAt.Format(time.RFC3339Nano),
 	)
 	return message, err
@@ -532,7 +539,7 @@ func (s *Store) ListMessages(ctx context.Context, userID, sessionID string, limi
 	}
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT m.id, m.session_id, m.role, m.content, m.created_at
+		`SELECT m.id, m.session_id, m.role, m.content, m.model, m.created_at
 		 FROM messages m
 		 JOIN sessions s ON s.id = m.session_id
 		 WHERE m.session_id = ? AND s.user_id = ?
@@ -556,6 +563,7 @@ func (s *Store) ListMessages(ctx context.Context, userID, sessionID string, limi
 			&message.SessionID,
 			&message.Role,
 			&message.Content,
+			&message.Model,
 			&createdAt,
 		); err != nil {
 			return nil, err
