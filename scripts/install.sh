@@ -80,11 +80,23 @@ prepare_source() {
     src="$(download_repo_source)"
   fi
 
-  if [[ -z "${src}" || ! -f "${src}/fj_go_server/go.mod" ]]; then
+  if [[ -z "${src}" ]]; then
     echo "Source not found. Pass SOURCE_DIR=/path/to/repo or configure GITHUB_REPO/GITHUB_REF." >&2
     exit 1
   fi
-  echo "${src}"
+
+  if [[ -f "${src}/go.mod" ]]; then
+    echo "${src}"
+    return
+  fi
+
+  if [[ -f "${src}/fj_go_server/go.mod" ]]; then
+    echo "${src}/fj_go_server"
+    return
+  fi
+
+  echo "Source not found. Expected go.mod at source root or source/fj_go_server." >&2
+  exit 1
 }
 
 download_repo_source() {
@@ -130,7 +142,7 @@ install_prebuilt_binary() {
 build_binary() {
   local src="${1}"
   log "Building relay binary..."
-  pushd "${src}/fj_go_server" >/dev/null
+  pushd "${src}" >/dev/null
   go mod tidy
   CGO_ENABLED=1 go build -o "${APP_HOME}/fj-go-relay" ./cmd/server
   popd >/dev/null
