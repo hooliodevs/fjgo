@@ -14,9 +14,14 @@ GITHUB_REPO="${GITHUB_REPO:-hooliodevs/fjgo}"
 GITHUB_REF="${GITHUB_REF:-main}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 TMP_SRC_DIR="/tmp/fj-go-relay-src"
+PAIR_INFO_CMD="/usr/local/bin/fj-go-relay-info"
 
 log() {
   echo "[fj-install] $*"
+}
+
+as_app_user() {
+  sudo -u "${APP_USER}" -H "$@"
 }
 
 require_root() {
@@ -39,6 +44,26 @@ install_packages() {
     log "Unsupported package manager. Install curl/git/sqlite3/build tools manually."
     exit 1
   fi
+}
+
+prompt_for_github_token() {
+  if [[ -n "${GITHUB_TOKEN}" ]]; then
+    log "GitHub token provided via environment."
+    return
+  fi
+
+  if [[ ! -r /dev/tty ]]; then
+    log "No interactive TTY available. Skipping token prompt."
+    log "For private repo cloning support, rerun with GITHUB_TOKEN=..."
+    return
+  fi
+
+  log "Optional: configure GitHub token for private repository cloning."
+  log "Create a fine-grained token here:"
+  log "https://github.com/settings/personal-access-tokens/new"
+  log "Minimum permission: Repository contents: Read-only (for needed repos)."
+  printf "Enter GitHub token (leave empty to skip): " > /dev/tty
+  IFS= read -r GITHUB_TOKEN < /dev/tty || true
 }
 
 install_go_if_missing() {
@@ -139,6 +164,25 @@ install_prebuilt_binary() {
   return 0
 }
 
+configure_git_auth() {
+  if [[ -z "${GITHUB_TOKEN}" ]]; then
+    log "GitHub token not set. Private HTTPS repo clones may fail."
+    return
+  fi
+
+  local creds_file="${APP_HOME}/.git-credentials"
+  printf "https://x-access-token:%s@github.com\n" "${GITHUB_TOKEN}" > "${creds_file}"
+  chown "${APP_USER}:${APP_USER}" "${creds_file}"
+  chmod 600 "${creds_file}"
+
+  as_app_user git config --global credential.helper "store --file ${creds_file}"
+  as_app_user git config --global credential.useHttpPath true
+  as_app_user git config --global url."https://github.com/".insteadOf "git@github.com:"
+  as_app_user git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+  as_app_user git config --global advice.detachedHead false || true
+  log "Configured GitHub credential helper for ${APP_USER}."
+}
+
 build_binary() {
   local src="${1}"
   log "Building relay binary..."
@@ -210,6 +254,27 @@ EOF
   systemctl enable --now "${APP_NAME}"
 }
 
+install_pair_info_command() {
+  cat >"${PAIR_INFO_CMD}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+ENV_FILE="/etc/fj-go-relay.env"
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Pairing env file not found: ${ENV_FILE}" >&2
+  exit 1
+fi
+SERVER_URL="$(awk -F= '/^SERVER_URL=/{print $2}' "${ENV_FILE}")"
+PAIR_CODE="$(awk -F= '/^PAIR_CODE=/{print $2}' "${ENV_FILE}")"
+LAUNCH_CMD="$(awk -F= '/^DEFAULT_CURSOR_COMMAND=/{print $2}' "${ENV_FILE}")"
+echo "Server URL: ${SERVER_URL}"
+echo "Pair Code: ${PAIR_CODE}"
+echo "Launch Command: ${LAUNCH_CMD}"
+echo "Pairing payload:"
+printf '{"server_url":"%s","pair_code":"%s"}\n' "${SERVER_URL}" "${PAIR_CODE}"
+EOF
+  chmod 755 "${PAIR_INFO_CMD}"
+}
+
 print_pairing_info() {
   log "----------------------------------------------------------"
   log "Install complete."
@@ -233,12 +298,16 @@ print_pairing_info() {
   log "1) Switch to service user shell: sudo -u ${APP_USER} -H bash"
   log "2) Run Cursor auth command you already use (e.g., cursor login)."
   log "3) Verify CLI command works before starting sessions from mobile app."
+  log ""
+  log "Reminder command:"
+  log "  ${PAIR_INFO_CMD}"
   log "----------------------------------------------------------"
 }
 
 main() {
   require_root
   install_packages
+  prompt_for_github_token
   ensure_user_and_paths
   if ! install_prebuilt_binary; then
     install_go_if_missing
@@ -246,9 +315,11 @@ main() {
     source_dir="$(prepare_source "${1:-}")"
     build_binary "${source_dir}"
   fi
+  configure_git_auth
   cursor_setup_guide
   write_env_file
   install_service
+  install_pair_info_command
   print_pairing_info
 }
 
