@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +36,7 @@ type Session struct {
 	Name          string    `json:"name"`
 	LaunchCommand string    `json:"launch_command"`
 	CursorChatID  string    `json:"cursor_chat_id"`
+	CursorModel   string    `json:"cursor_model"`
 	State         string    `json:"state"`
 	LastError     string    `json:"last_error"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -91,6 +93,7 @@ func (s *Store) Init(ctx context.Context) error {
 			name TEXT NOT NULL,
 			launch_command TEXT NOT NULL,
 			cursor_chat_id TEXT NOT NULL DEFAULT '',
+			cursor_model TEXT NOT NULL DEFAULT 'gemini-flash-3',
 			state TEXT NOT NULL,
 			last_error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
@@ -120,6 +123,9 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "sessions", "cursor_chat_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("ensure sessions.cursor_chat_id: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "sessions", "cursor_model", "TEXT NOT NULL DEFAULT 'gemini-flash-3'"); err != nil {
+		return fmt.Errorf("ensure sessions.cursor_model: %w", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -344,8 +350,11 @@ func (s *Store) WorkspaceByID(ctx context.Context, userID, workspaceID string) (
 	return workspace, nil
 }
 
-func (s *Store) CreateSession(ctx context.Context, userID, workspaceID, name, launchCommand string) (Session, error) {
+func (s *Store) CreateSession(ctx context.Context, userID, workspaceID, name, launchCommand, cursorModel string) (Session, error) {
 	now := time.Now().UTC()
+	if strings.TrimSpace(cursorModel) == "" {
+		cursorModel = "gemini-flash-3"
+	}
 	session := Session{
 		ID:            uuid.NewString(),
 		UserID:        userID,
@@ -353,20 +362,22 @@ func (s *Store) CreateSession(ctx context.Context, userID, workspaceID, name, la
 		Name:          name,
 		LaunchCommand: launchCommand,
 		CursorChatID:  "",
+		CursorModel:   cursorModel,
 		State:         "idle",
 		CreatedAt:     now,
 		LastActiveAt:  now,
 	}
 	_, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO sessions(id, user_id, workspace_id, name, launch_command, cursor_chat_id, state, created_at, last_active_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions(id, user_id, workspace_id, name, launch_command, cursor_chat_id, cursor_model, state, created_at, last_active_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		session.ID,
 		session.UserID,
 		session.WorkspaceID,
 		session.Name,
 		session.LaunchCommand,
 		session.CursorChatID,
+		session.CursorModel,
 		session.State,
 		session.CreatedAt.Format(time.RFC3339Nano),
 		session.LastActiveAt.Format(time.RFC3339Nano),
@@ -379,7 +390,7 @@ func (s *Store) SessionByID(ctx context.Context, userID, sessionID string) (Sess
 	var createdAt, lastActiveAt string
 	err := s.db.QueryRowContext(
 		ctx,
-		`SELECT id, user_id, workspace_id, name, launch_command, cursor_chat_id, state, last_error, created_at, last_active_at
+		`SELECT id, user_id, workspace_id, name, launch_command, cursor_chat_id, cursor_model, state, last_error, created_at, last_active_at
 		 FROM sessions
 		 WHERE id = ? AND user_id = ?`,
 		sessionID, userID,
@@ -390,6 +401,7 @@ func (s *Store) SessionByID(ctx context.Context, userID, sessionID string) (Sess
 		&session.Name,
 		&session.LaunchCommand,
 		&session.CursorChatID,
+		&session.CursorModel,
 		&session.State,
 		&session.LastError,
 		&createdAt,
@@ -406,7 +418,7 @@ func (s *Store) SessionByID(ctx context.Context, userID, sessionID string) (Sess
 func (s *Store) ListSessions(ctx context.Context, userID string) ([]Session, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT id, user_id, workspace_id, name, launch_command, cursor_chat_id, state, last_error, created_at, last_active_at
+		`SELECT id, user_id, workspace_id, name, launch_command, cursor_chat_id, cursor_model, state, last_error, created_at, last_active_at
 		 FROM sessions
 		 WHERE user_id = ?
 		 ORDER BY last_active_at DESC`,
@@ -428,6 +440,7 @@ func (s *Store) ListSessions(ctx context.Context, userID string) ([]Session, err
 			&session.Name,
 			&session.LaunchCommand,
 			&session.CursorChatID,
+			&session.CursorModel,
 			&session.State,
 			&session.LastError,
 			&createdAt,
@@ -473,6 +486,19 @@ func (s *Store) SetSessionCursorChatID(ctx context.Context, sessionID, cursorCha
 		 SET cursor_chat_id = ?, last_active_at = ?
 		 WHERE id = ?`,
 		cursorChatID,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		sessionID,
+	)
+	return err
+}
+
+func (s *Store) SetSessionModel(ctx context.Context, sessionID, cursorModel string) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE sessions
+		 SET cursor_model = ?, last_active_at = ?
+		 WHERE id = ?`,
+		cursorModel,
 		time.Now().UTC().Format(time.RFC3339Nano),
 		sessionID,
 	)

@@ -225,6 +225,7 @@ type createSessionRequest struct {
 	WorkspaceID   string `json:"workspace_id"`
 	Name          string `json:"name"`
 	LaunchCommand string `json:"launch_command"`
+	Model         string `json:"model"`
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -236,6 +237,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	req.WorkspaceID = strings.TrimSpace(req.WorkspaceID)
 	req.Name = strings.TrimSpace(req.Name)
 	req.LaunchCommand = strings.TrimSpace(req.LaunchCommand)
+	req.Model = strings.TrimSpace(req.Model)
 	if req.WorkspaceID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "workspace_id is required"})
 		return
@@ -246,6 +248,9 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if req.LaunchCommand == "" {
 		req.LaunchCommand = s.cfg.DefaultCursorCommand
 	}
+	if req.Model == "" {
+		req.Model = "gemini-flash-3"
+	}
 
 	userID := auth.UserID(r.Context())
 	if _, err := s.store.WorkspaceByID(r.Context(), userID, req.WorkspaceID); err != nil {
@@ -253,7 +258,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := s.store.CreateSession(r.Context(), userID, req.WorkspaceID, req.Name, req.LaunchCommand)
+	session, err := s.store.CreateSession(r.Context(), userID, req.WorkspaceID, req.Name, req.LaunchCommand, req.Model)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to create session"})
 		return
@@ -286,6 +291,8 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 		s.handleListMessages(w, r, sessionID)
 	case action == "input" && r.Method == http.MethodPost:
 		s.handleSessionInput(w, r, sessionID)
+	case action == "model" && r.Method == http.MethodPost:
+		s.handleSessionModel(w, r, sessionID)
 	case action == "interrupt" && r.Method == http.MethodPost:
 		s.handleSessionInterrupt(w, r, sessionID)
 	case action == "stream" && r.Method == http.MethodGet:
@@ -293,6 +300,37 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown session action"})
 	}
+}
+
+type sessionModelRequest struct {
+	Model string `json:"model"`
+}
+
+func (s *Server) handleSessionModel(w http.ResponseWriter, r *http.Request, sessionID string) {
+	userID := auth.UserID(r.Context())
+	_, err := s.store.SessionByID(r.Context(), userID, sessionID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "session not found"})
+		return
+	}
+
+	var req sessionModelRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	if req.Model == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model is required"})
+		return
+	}
+
+	if err := s.store.SetSessionModel(r.Context(), sessionID, req.Model); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to update model"})
+		return
+	}
+	s.runtime.UpdateSessionModel(sessionID, req.Model)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "model": req.Model})
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request, sessionID string) {

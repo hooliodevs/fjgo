@@ -48,6 +48,7 @@ type SessionRuntime struct {
 	ptyFile   *os.File
 	cursorCmd string
 	chatID    string
+	model     string
 	inputs    chan string
 
 	mu            sync.Mutex
@@ -113,6 +114,16 @@ func (m *Manager) Shutdown() {
 		_ = rt.shutdown()
 		delete(m.runtimes, id)
 	}
+}
+
+func (m *Manager) UpdateSessionModel(sessionID, model string) {
+	m.mu.Lock()
+	rt, ok := m.runtimes[sessionID]
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	rt.SetModel(model)
 }
 
 func (m *Manager) startRuntime(session store.Session, workspace store.Workspace) (*SessionRuntime, error) {
@@ -187,6 +198,10 @@ func (rt *SessionRuntime) startCursorMode(cursorExec string) error {
 	rt.mode = "cursor_print"
 	rt.cursorCmd = cursorExec
 	rt.chatID = chatID
+	rt.model = strings.TrimSpace(rt.session.CursorModel)
+	if rt.model == "" {
+		rt.model = "gemini-flash-3"
+	}
 	rt.inputs = make(chan string, 64)
 	go rt.cursorWorker()
 	return nil
@@ -202,7 +217,11 @@ func (rt *SessionRuntime) runCursorPrompt(prompt string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	rt.mu.Lock()
 	rt.currentCancel = cancel
+	model := rt.model
 	rt.mu.Unlock()
+	if strings.TrimSpace(model) == "" {
+		model = "gemini-flash-3"
+	}
 
 	cmd := exec.CommandContext(
 		ctx,
@@ -213,6 +232,8 @@ func (rt *SessionRuntime) runCursorPrompt(prompt string) {
 		"--trust",
 		"--workspace",
 		rt.workspace.LocalPath,
+		"--model",
+		model,
 		"--resume",
 		rt.chatID,
 		prompt,
@@ -259,6 +280,16 @@ func (rt *SessionRuntime) runCursorPrompt(prompt string) {
 		SessionID: rt.session.ID,
 		Timestamp: time.Now().UTC(),
 	})
+}
+
+func (rt *SessionRuntime) SetModel(model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	rt.mu.Lock()
+	rt.model = model
+	rt.mu.Unlock()
 }
 
 func (rt *SessionRuntime) readLoop() {
