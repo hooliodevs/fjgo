@@ -68,6 +68,24 @@ prompt_for_github_token() {
   IFS= read -r GITHUB_TOKEN < /dev/tty || true
 }
 
+load_existing_github_token() {
+  if [[ -n "${GITHUB_TOKEN}" ]]; then
+    return
+  fi
+
+  local creds_file="${APP_HOME}/.git-credentials"
+  if [[ ! -f "${creds_file}" ]]; then
+    return
+  fi
+
+  local creds_line
+  creds_line="$(sed -n '1p' "${creds_file}")"
+  if [[ "${creds_line}" =~ ^https://x-access-token:([^@]+)@github\.com/?$ ]]; then
+    GITHUB_TOKEN="${BASH_REMATCH[1]}"
+    log "Reusing existing GitHub token from ${creds_file}."
+  fi
+}
+
 install_go_if_missing() {
   if command -v go >/dev/null 2>&1; then
     log "Go already installed: $(go version)"
@@ -525,6 +543,7 @@ main() {
   install_packages
   prompt_for_github_token
   ensure_user_and_paths
+  load_existing_github_token
   if ! install_prebuilt_binary; then
     install_go_if_missing
     local source_dir
