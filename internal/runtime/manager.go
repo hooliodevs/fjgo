@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -112,6 +113,10 @@ func (m *Manager) startRuntime(session store.Session, workspace store.Workspace)
 	if command == "" {
 		return nil, errors.New("session launch command is empty")
 	}
+
+	// Cursor prompts for workspace trust on first run in a directory.
+	// Bootstrap trust in non-interactive mode so mobile sessions start cleanly.
+	maybeBootstrapCursorTrust(workspace.LocalPath, command)
 
 	cmd := exec.Command("bash", "-lc", command)
 	cmd.Dir = workspace.LocalPath
@@ -333,4 +338,45 @@ func (rt *SessionRuntime) broadcast(event Event) {
 		default:
 		}
 	}
+}
+
+func maybeBootstrapCursorTrust(workspacePath, launchCommand string) {
+	cursorExec, isCursor := cursorExecutableFromCommand(launchCommand)
+	if !isCursor {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	trustCommand := fmt.Sprintf(
+		"%s --print --trust --output-format text %s >/dev/null 2>&1",
+		shellQuote(cursorExec),
+		shellQuote("Trust bootstrap"),
+	)
+	cmd := exec.CommandContext(ctx, "bash", "-lc", trustCommand)
+	cmd.Dir = workspacePath
+	if err := cmd.Run(); err != nil {
+		log.Printf("cursor trust bootstrap skipped in %q: %v", workspacePath, err)
+	}
+}
+
+func cursorExecutableFromCommand(launchCommand string) (string, bool) {
+	fields := strings.Fields(launchCommand)
+	if len(fields) == 0 {
+		return "", false
+	}
+	first := strings.TrimSpace(fields[0])
+	base := first
+	if idx := strings.LastIndex(first, "/"); idx >= 0 {
+		base = first[idx+1:]
+	}
+	if base != "cursor" && base != "cursor-agent" {
+		return "", false
+	}
+	return first, true
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
