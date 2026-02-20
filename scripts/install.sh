@@ -20,6 +20,7 @@ TMP_SRC_DIR="/tmp/fj-go-relay-src"
 PAIR_INFO_CMD="/usr/local/bin/fj-go-relay-info"
 SELF_CHECK_CMD="/usr/local/bin/fj-go-relay-self-check"
 PRIV_CONFIRM_CMD="/usr/local/bin/fj-go-relay-privilege-confirmation"
+UPDATE_CMD="/usr/local/bin/fj-go-relay-update"
 
 log() {
   echo "[fj-install] $*" >&2
@@ -531,6 +532,30 @@ EOF
   chmod 755 "${PRIV_CONFIRM_CMD}"
 }
 
+install_update_command() {
+  cat >"${UPDATE_CMD}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_URL="https://raw.githubusercontent.com/hooliodevs/fjgo/main/scripts/install.sh"
+
+run_install() {
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl -fsSL "${INSTALL_URL}?v=$(date +%s)" | sudo GITHUB_TOKEN="${GITHUB_TOKEN}" bash
+  else
+    curl -fsSL "${INSTALL_URL}?v=$(date +%s)" | sudo bash
+  fi
+}
+
+main() {
+  run_install
+}
+
+main "$@"
+EOF
+  chmod 755 "${UPDATE_CMD}"
+}
+
 install_self_check_command() {
   cat >"${SELF_CHECK_CMD}" <<'EOF'
 #!/usr/bin/env bash
@@ -737,6 +762,8 @@ print_pairing_info() {
   log "  ${SELF_CHECK_CMD}"
   log "Privilege confirmation command:"
   log "  ${PRIV_CONFIRM_CMD} [status|enable|disable|toggle]"
+  log "Update command:"
+  log "  ${UPDATE_CMD}"
   log "----------------------------------------------------------"
 }
 
@@ -760,6 +787,7 @@ main() {
   install_service
   install_pair_info_command
   install_privilege_confirmation_command
+  install_update_command
   install_self_check_command
   print_pairing_info
 }

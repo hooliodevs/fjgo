@@ -40,6 +40,12 @@ Run full post-install diagnostics:
 sudo fj-go-relay-self-check
 ```
 
+Update the server later with one command:
+
+```bash
+sudo fj-go-relay-update
+```
+
 Manage privileged command confirmation policy:
 
 ```bash
@@ -134,6 +140,12 @@ Re-run installer:
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/hooliodevs/fjgo/main/scripts/install.sh?v=$(date +%s)" | sudo bash
 sudo systemctl restart fj-go-relay
+```
+
+Shortcut (installed by the script):
+
+```bash
+sudo fj-go-relay-update
 ```
 
 ## Local development run
