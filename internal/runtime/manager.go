@@ -59,6 +59,38 @@ type SessionRuntime struct {
 	currentCancel context.CancelFunc
 }
 
+type liveCursorWriter struct {
+	rt *SessionRuntime
+
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (w *liveCursorWriter) Write(p []byte) (int, error) {
+	chunk := string(p)
+	if chunk == "" {
+		return len(p), nil
+	}
+
+	w.mu.Lock()
+	w.buf.WriteString(chunk)
+	w.mu.Unlock()
+
+	w.rt.broadcast(Event{
+		Type:      "message_delta",
+		SessionID: w.rt.session.ID,
+		Content:   chunk,
+		Timestamp: time.Now().UTC(),
+	})
+	return len(p), nil
+}
+
+func (w *liveCursorWriter) Output() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return strings.TrimSpace(w.buf.String())
+}
+
 type subscriber struct {
 	id   string
 	conn *websocket.Conn
@@ -252,14 +284,28 @@ func (rt *SessionRuntime) runCursorPrompt(prompt string) {
 		prompt,
 	)
 	cmd.Dir = rt.workspace.LocalPath
-	output, err := cmd.CombinedOutput()
+	liveOutput := &liveCursorWriter{rt: rt}
+	cmd.Stdout = liveOutput
+	cmd.Stderr = liveOutput
+	if err := cmd.Start(); err != nil {
+		message := fmt.Sprintf("failed to start cursor command: %v", err)
+		_ = rt.store.UpdateSessionState(context.Background(), rt.session.ID, "error", message)
+		rt.broadcast(Event{
+			Type:      "error",
+			SessionID: rt.session.ID,
+			Error:     message,
+			Timestamp: time.Now().UTC(),
+		})
+		return
+	}
+	err := cmd.Wait()
 
 	rt.mu.Lock()
 	rt.currentCancel = nil
 	rt.mu.Unlock()
 	cancel()
 
-	content := strings.TrimSpace(string(output))
+	content := liveOutput.Output()
 	if err != nil {
 		message := err.Error()
 		if content != "" {
@@ -277,17 +323,17 @@ func (rt *SessionRuntime) runCursorPrompt(prompt string) {
 
 	if content == "" {
 		content = "(No response text returned by Cursor)"
+		rt.broadcast(Event{
+			Type:      "message_delta",
+			SessionID: rt.session.ID,
+			Content:   content,
+			Timestamp: time.Now().UTC(),
+		})
 	}
 
 	_, _ = rt.store.AddMessage(context.Background(), rt.session.ID, "assistant", content, model)
 	_ = rt.store.UpdateSessionState(context.Background(), rt.session.ID, "active", "")
 	_ = rt.store.TouchSession(context.Background(), rt.session.ID)
-	rt.broadcast(Event{
-		Type:      "message_delta",
-		SessionID: rt.session.ID,
-		Content:   content,
-		Timestamp: time.Now().UTC(),
-	})
 	rt.broadcast(Event{
 		Type:      "message_done",
 		SessionID: rt.session.ID,
