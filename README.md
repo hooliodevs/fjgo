@@ -160,32 +160,431 @@ If you use a custom command, login with that command path instead.
 
 ## API (v1)
 
-- `GET /v1/health`
-- `GET /v1/server/info`
-- `POST /v1/pair`
-- `GET /v1/server/settings/privilege-confirmation`
-- `POST /v1/server/settings/privilege-confirmation`
-- `GET /v1/workspaces`
-- `POST /v1/workspaces/clone`
-- `GET /v1/sessions`
-- `POST /v1/sessions`
-- `GET /v1/sessions/:id/approvals/pending`
-- `POST /v1/sessions/:id/approvals`
-- `POST /v1/sessions/:id/approvals/:approval_id/confirm`
-- `POST /v1/sessions/:id/model`
-- `GET /v1/sessions/:id/messages`
-- `POST /v1/sessions/:id/input`
-- `POST /v1/sessions/:id/interrupt`
-- `GET /v1/sessions/:id/stream` (WebSocket)
-- `GET /v1/workspaces/:id/git/status`
-- `GET /v1/workspaces/:id/git/diff?file=<path>&staged=<true|false>`
-- `POST /v1/workspaces/:id/git/stage`
-- `POST /v1/workspaces/:id/git/unstage`
-- `POST /v1/workspaces/:id/git/commit`
-- `POST /v1/workspaces/:id/git/push`
-- `POST /v1/workspaces/:id/git/pull`
-- `POST /v1/workspaces/:id/git/discard`
-- `GET /v1/workspaces/:id/git/log?limit=<n>`
+Base URL example: `http://<SERVER_IP>:8787`
+
+All authenticated endpoints require:
+
+```http
+Authorization: Bearer <access_token>
+```
+
+Paths are exact matches (for example, `/v1/server/settings/privilege-confirmation/` with a trailing slash returns `404`).
+
+### Response conventions
+
+- Most success responses are JSON.
+- Most non-success responses are JSON: `{"error":"..."}`.
+- Some endpoints include an optional `detail` field (for example clone failure).
+
+### Public endpoints (no bearer required)
+
+#### `GET /v1/health`
+
+Returns service health.
+
+```json
+{
+  "ok": true,
+  "service": "fj-go-relay",
+  "time": "2026-02-20T22:00:00Z"
+}
+```
+
+#### `GET /v1/server/info`
+
+Returns pairing metadata and default port.
+
+```json
+{
+  "server_id": "srv_xxx",
+  "pair_code_expires_at": "2026-03-22T10:00:00Z",
+  "default_port": "8787"
+}
+```
+
+#### `POST /v1/pair`
+
+Pair a device and obtain access token.
+
+Request body:
+
+```json
+{
+  "pair_code": "ABC-123",
+  "device_name": "My iPhone"
+}
+```
+
+Success (`201`):
+
+```json
+{
+  "access_token": "raw_token",
+  "device_id": "uuid",
+  "server_id": "srv_xxx"
+}
+```
+
+Errors:
+
+- `400` invalid body or missing fields
+- `401` invalid/expired pair code
+- `500` server error
+
+### Authenticated server endpoints
+
+#### `GET /v1/server/pairing`
+
+Returns current pair code and expiry.
+
+```json
+{
+  "pair_code": "ABC-123",
+  "pair_code_expires_at": "2026-03-22T10:00:00Z"
+}
+```
+
+#### `GET /v1/server/settings/privilege-confirmation`
+
+Returns whether privileged command confirmation is required.
+
+```json
+{
+  "required": true
+}
+```
+
+#### `POST /v1/server/settings/privilege-confirmation`
+
+Updates privilege confirmation requirement.
+
+Request body:
+
+```json
+{
+  "required": false
+}
+```
+
+Success (`200`):
+
+```json
+{
+  "required": false
+}
+```
+
+### Workspace endpoints
+
+#### `GET /v1/workspaces`
+
+Returns all workspaces for the authenticated user.
+
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "user_id": "local-user",
+      "name": "fj",
+      "repo_url": "https://github.com/hooliodevs/fj.git",
+      "local_path": "/var/lib/fj-go-relay/workspaces/fj-123",
+      "status": "ready",
+      "created_at": "2026-02-20T21:00:00Z"
+    }
+  ]
+}
+```
+
+#### `POST /v1/workspaces/clone`
+
+Clones a git repository into a new workspace.
+
+Request body:
+
+```json
+{
+  "repo_url": "https://github.com/hooliodevs/fj.git",
+  "name": "fj"
+}
+```
+
+`name` is optional; repo name is inferred when omitted.
+
+Success (`201`): workspace object.
+
+Clone failure (`400`) example:
+
+```json
+{
+  "error": "git clone failed",
+  "detail": "<git stderr/stdout>"
+}
+```
+
+### Session endpoints
+
+#### `GET /v1/sessions?workspace_id=<workspace_id>`
+
+Returns sessions for user, optionally scoped to one workspace.
+
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "user_id": "local-user",
+      "workspace_id": "uuid",
+      "name": "Chat 2026-02-20 21:10",
+      "launch_command": "cursor",
+      "cursor_chat_id": "",
+      "cursor_model": "gemini-3-flash",
+      "state": "idle",
+      "last_error": "",
+      "created_at": "2026-02-20T21:10:00Z",
+      "last_active_at": "2026-02-20T21:10:00Z"
+    }
+  ]
+}
+```
+
+#### `POST /v1/sessions`
+
+Creates a session.
+
+Request body:
+
+```json
+{
+  "workspace_id": "uuid",
+  "name": "My Chat",
+  "launch_command": "cursor",
+  "model": "gemini-3-flash"
+}
+```
+
+Notes:
+
+- `workspace_id` is required.
+- `name`, `launch_command`, and `model` are optional; server fills defaults.
+
+Success (`201`): session object.
+
+#### `DELETE /v1/sessions/:id`
+
+Deletes a session. Success response is `204 No Content`.
+
+#### `GET /v1/sessions/:id/messages?limit=<n>`
+
+Returns ordered session messages.
+
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "session_id": "uuid",
+      "role": "user",
+      "content": "hello",
+      "model": "",
+      "created_at": "2026-02-20T21:12:00Z"
+    }
+  ]
+}
+```
+
+`limit` defaults to `500`, max `5000`.
+
+#### `POST /v1/sessions/:id/input`
+
+Sends user input to running session.
+
+Request body:
+
+```json
+{
+  "content": "Explain this repository"
+}
+```
+
+Success response: `202 {"ok":true}`.
+
+If privilege confirmation is enabled and a pending approval exists, returns `409`:
+
+```json
+{
+  "error": "privileged commands are pending explicit confirmation",
+  "approval": { "...": "approval object" }
+}
+```
+
+#### `POST /v1/sessions/:id/interrupt`
+
+Interrupts current generation. Success: `200 {"ok":true}`.
+
+#### `POST /v1/sessions/:id/model`
+
+Updates active session model.
+
+Request body:
+
+```json
+{
+  "model": "gemini-3-flash"
+}
+```
+
+Success response:
+
+```json
+{
+  "ok": true,
+  "model": "gemini-3-flash"
+}
+```
+
+#### `GET /v1/sessions/:id/stream` (WebSocket)
+
+WebSocket stream for realtime session events.
+
+- Use bearer token in websocket headers.
+- Server emits JSON events like:
+  - `session_state`
+  - `message_delta`
+  - `message_done`
+  - `error`
+
+### Privileged approval endpoints
+
+#### `GET /v1/sessions/:id/approvals/pending`
+
+Returns current pending approval (or `null`).
+
+```json
+{
+  "item": {
+    "id": "uuid",
+    "user_id": "local-user",
+    "session_id": "uuid",
+    "commands": ["sudo apt update"],
+    "reason": "Install dependency",
+    "status": "pending",
+    "approval_key": "",
+    "created_at": "2026-02-20T21:30:00Z"
+  }
+}
+```
+
+#### `POST /v1/sessions/:id/approvals`
+
+Creates a privileged approval request.
+
+Request body:
+
+```json
+{
+  "commands": ["sudo apt update", "sudo apt install -y ripgrep"],
+  "reason": "Install required tooling"
+}
+```
+
+Success: `201` with approval object.
+
+If another approval is pending: `409` with `error` + `approval`.
+
+#### `POST /v1/sessions/:id/approvals/:approval_id/confirm`
+
+Approves or rejects a pending request.
+
+Request body:
+
+```json
+{
+  "approve": true,
+  "reviewed_by": "toby"
+}
+```
+
+Success: `200` with updated approval object (approved entries include `approval_key`).
+
+### Git endpoints
+
+All git endpoints are under:
+
+`/v1/workspaces/:id/git/*`
+
+and require the workspace to exist, be accessible, and contain a `.git` directory.
+
+#### `GET /status`
+
+Returns branch/ahead/behind plus parsed file status.
+
+#### `GET /diff?file=<relative_path>&staged=<true|false>`
+
+Returns:
+
+```json
+{
+  "file": "lib/main.dart",
+  "staged": false,
+  "diff": "<git diff text>"
+}
+```
+
+#### `POST /stage`
+
+Request body:
+
+- stage all:
+
+```json
+{"all": true}
+```
+
+- or stage selected paths:
+
+```json
+{"paths": ["lib/main.dart", "README.md"]}
+```
+
+#### `POST /unstage`
+
+```json
+{"paths": ["lib/main.dart"]}
+```
+
+#### `POST /commit`
+
+```json
+{"message": "feat: add docs"}
+```
+
+Returns command output.
+
+#### `POST /push`
+
+```json
+{"remote": "origin", "branch": "main"}
+```
+
+`remote` and `branch` are optional.
+
+#### `POST /pull`
+
+Performs `git pull --ff-only`.
+
+#### `POST /discard`
+
+```json
+{"paths": ["lib/main.dart"]}
+```
+
+Restores tracked file state and removes untracked files/dirs for each path.
+
+#### `GET /log?limit=<n>`
+
+Returns commit list (`hash`, `short_hash`, `author`, `email`, `subject`, `committed_at`).
+`limit` default: `20`, max: `200`.
 
 ## Privileged command confirmation
 

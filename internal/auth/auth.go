@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -24,17 +25,17 @@ func (m *Middleware) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearer(r.Header.Get("Authorization"))
 		if token == "" {
-			http.Error(w, "missing bearer token", http.StatusUnauthorized)
+			writeErrorJSON(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
 
 		userID, err := m.store.UserIDByTokenHash(r.Context(), store.HashToken(token))
 		if err != nil {
-			http.Error(w, "auth lookup failed", http.StatusInternalServerError)
+			writeErrorJSON(w, http.StatusInternalServerError, "auth lookup failed")
 			return
 		}
 		if userID == "" {
-			http.Error(w, "invalid token", http.StatusUnauthorized)
+			writeErrorJSON(w, http.StatusUnauthorized, "invalid token")
 			return
 		}
 
@@ -60,4 +61,10 @@ func extractBearer(value string) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[1])
+}
+
+func writeErrorJSON(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
