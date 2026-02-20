@@ -99,3 +99,12 @@ go run ./cmd/server
 - `POST /v1/sessions/:id/input`
 - `POST /v1/sessions/:id/interrupt`
 - `GET /v1/sessions/:id/stream` (WebSocket)
+- `GET /v1/sessions/:id/approvals/pending`
+- `POST /v1/sessions/:id/approvals`
+- `POST /v1/sessions/:id/approvals/:approval_id/confirm`
+
+## Privileged command confirmation
+
+- Installer now configures relay to run as `cursor` with passwordless sudo on staging hosts.
+- Runtime prompt policy asks Cursor to list privileged commands first and wait for approval.
+- To disable confirmation temporarily, set `PRIVILEGE_CONFIRMATION_DISABLED=true` in `/etc/fj-go-relay.env` and restart service.

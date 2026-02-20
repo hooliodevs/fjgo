@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -43,14 +44,28 @@ type Session struct {
 	LastActiveAt  time.Time `json:"last_active_at"`
 }
 
-type 	Message struct {
-		ID        string    `json:"id"`
-		SessionID string    `json:"session_id"`
-		Role      string    `json:"role"`
-		Content   string    `json:"content"`
-		Model     string    `json:"model"`
-		CreatedAt time.Time `json:"created_at"`
-	}
+type PrivilegeApproval struct {
+	ID          string     `json:"id"`
+	UserID      string     `json:"user_id"`
+	SessionID   string     `json:"session_id"`
+	Commands    []string   `json:"commands"`
+	Reason      string     `json:"reason"`
+	Status      string     `json:"status"`
+	ApprovalKey string     `json:"approval_key,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ReviewedAt  *time.Time `json:"reviewed_at,omitempty"`
+	ReviewedBy  string     `json:"reviewed_by,omitempty"`
+	ConsumedAt  *time.Time `json:"consumed_at,omitempty"`
+}
+
+type Message struct {
+	ID        string    `json:"id"`
+	SessionID string    `json:"session_id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	Model     string    `json:"model"`
+	CreatedAt time.Time `json:"created_at"`
+}
 
 func New(db *sql.DB) *Store {
 	return &Store{db: db}
@@ -111,11 +126,27 @@ func (s *Store) Init(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);`,
+		`CREATE TABLE IF NOT EXISTS privilege_approvals (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			commands_json TEXT NOT NULL,
+			reason TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			approval_key TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			reviewed_at TEXT,
+			reviewed_by TEXT NOT NULL DEFAULT '',
+			consumed_at TEXT,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_workspaces_user ON workspaces(user_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_devices_token_hash ON devices(token_hash);`,
+		`CREATE INDEX IF NOT EXISTS idx_privilege_approvals_session_status ON privilege_approvals(session_id, status, created_at);`,
 	}
 
 	for _, stmt := range statements {
@@ -634,6 +665,213 @@ func (s *Store) NewPairToken() (rawToken, tokenHash string, err error) {
 	rawToken = hex.EncodeToString(buf)
 	tokenHash = HashToken(rawToken)
 	return rawToken, tokenHash, nil
+}
+
+func (s *Store) CreatePrivilegeApproval(ctx context.Context, userID, sessionID string, commands []string, reason string) (PrivilegeApproval, error) {
+	if len(commands) == 0 {
+		return PrivilegeApproval{}, errors.New("commands are required")
+	}
+	clean := make([]string, 0, len(commands))
+	for _, command := range commands {
+		command = strings.TrimSpace(command)
+		if command == "" {
+			continue
+		}
+		clean = append(clean, command)
+	}
+	if len(clean) == 0 {
+		return PrivilegeApproval{}, errors.New("commands are required")
+	}
+	commandsRaw, err := json.Marshal(clean)
+	if err != nil {
+		return PrivilegeApproval{}, err
+	}
+
+	approval := PrivilegeApproval{
+		ID:        uuid.NewString(),
+		UserID:    userID,
+		SessionID: sessionID,
+		Commands:  clean,
+		Reason:    strings.TrimSpace(reason),
+		Status:    "pending",
+		CreatedAt: time.Now().UTC(),
+	}
+
+	_, err = s.db.ExecContext(
+		ctx,
+		`INSERT INTO privilege_approvals(id, user_id, session_id, commands_json, reason, status, approval_key, created_at, reviewed_at, reviewed_by, consumed_at)
+		 VALUES(?, ?, ?, ?, ?, ?, '', ?, NULL, '', NULL)`,
+		approval.ID,
+		approval.UserID,
+		approval.SessionID,
+		string(commandsRaw),
+		approval.Reason,
+		approval.Status,
+		approval.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return PrivilegeApproval{}, err
+	}
+	return approval, nil
+}
+
+func (s *Store) PendingPrivilegeApproval(ctx context.Context, userID, sessionID string) (PrivilegeApproval, bool, error) {
+	row := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, user_id, session_id, commands_json, reason, status, approval_key, created_at, reviewed_at, reviewed_by, consumed_at
+		 FROM privilege_approvals
+		 WHERE user_id = ? AND session_id = ? AND status = 'pending'
+		 ORDER BY created_at DESC
+		 LIMIT 1`,
+		userID,
+		sessionID,
+	)
+	approval, err := scanPrivilegeApproval(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrivilegeApproval{}, false, nil
+	}
+	if err != nil {
+		return PrivilegeApproval{}, false, err
+	}
+	return approval, true, nil
+}
+
+func (s *Store) NextApprovedPrivilegeApproval(ctx context.Context, userID, sessionID string) (PrivilegeApproval, bool, error) {
+	row := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, user_id, session_id, commands_json, reason, status, approval_key, created_at, reviewed_at, reviewed_by, consumed_at
+		 FROM privilege_approvals
+		 WHERE user_id = ? AND session_id = ? AND status = 'approved' AND consumed_at IS NULL
+		 ORDER BY reviewed_at DESC, created_at DESC
+		 LIMIT 1`,
+		userID,
+		sessionID,
+	)
+	approval, err := scanPrivilegeApproval(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrivilegeApproval{}, false, nil
+	}
+	if err != nil {
+		return PrivilegeApproval{}, false, err
+	}
+	return approval, true, nil
+}
+
+func (s *Store) DecidePrivilegeApproval(ctx context.Context, userID, sessionID, approvalID string, approve bool, reviewedBy string) (PrivilegeApproval, error) {
+	current, err := s.privilegeApprovalByID(ctx, userID, sessionID, approvalID)
+	if err != nil {
+		return PrivilegeApproval{}, err
+	}
+	if current.Status != "pending" {
+		return PrivilegeApproval{}, errors.New("approval is no longer pending")
+	}
+
+	status := "rejected"
+	approvalKey := ""
+	if approve {
+		status = "approved"
+		approvalKey, err = randomHexToken(12)
+		if err != nil {
+			return PrivilegeApproval{}, err
+		}
+	}
+	reviewedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	reviewedBy = strings.TrimSpace(reviewedBy)
+
+	_, err = s.db.ExecContext(
+		ctx,
+		`UPDATE privilege_approvals
+		 SET status = ?, approval_key = ?, reviewed_at = ?, reviewed_by = ?
+		 WHERE id = ? AND user_id = ? AND session_id = ?`,
+		status,
+		approvalKey,
+		reviewedAt,
+		reviewedBy,
+		approvalID,
+		userID,
+		sessionID,
+	)
+	if err != nil {
+		return PrivilegeApproval{}, err
+	}
+	return s.privilegeApprovalByID(ctx, userID, sessionID, approvalID)
+}
+
+func (s *Store) MarkPrivilegeApprovalConsumed(ctx context.Context, userID, sessionID, approvalID string) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE privilege_approvals
+		 SET consumed_at = ?
+		 WHERE id = ? AND user_id = ? AND session_id = ? AND status = 'approved'`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		approvalID,
+		userID,
+		sessionID,
+	)
+	return err
+}
+
+func (s *Store) privilegeApprovalByID(ctx context.Context, userID, sessionID, approvalID string) (PrivilegeApproval, error) {
+	row := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, user_id, session_id, commands_json, reason, status, approval_key, created_at, reviewed_at, reviewed_by, consumed_at
+		 FROM privilege_approvals
+		 WHERE id = ? AND user_id = ? AND session_id = ?`,
+		approvalID,
+		userID,
+		sessionID,
+	)
+	return scanPrivilegeApproval(row)
+}
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPrivilegeApproval(row scanner) (PrivilegeApproval, error) {
+	var approval PrivilegeApproval
+	var commandsRaw string
+	var createdAtRaw string
+	var reviewedAtRaw sql.NullString
+	var consumedAtRaw sql.NullString
+	if err := row.Scan(
+		&approval.ID,
+		&approval.UserID,
+		&approval.SessionID,
+		&commandsRaw,
+		&approval.Reason,
+		&approval.Status,
+		&approval.ApprovalKey,
+		&createdAtRaw,
+		&reviewedAtRaw,
+		&approval.ReviewedBy,
+		&consumedAtRaw,
+	); err != nil {
+		return PrivilegeApproval{}, err
+	}
+	_ = json.Unmarshal([]byte(commandsRaw), &approval.Commands)
+	approval.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAtRaw)
+	if reviewedAtRaw.Valid {
+		reviewedAt, parseErr := time.Parse(time.RFC3339Nano, reviewedAtRaw.String)
+		if parseErr == nil {
+			approval.ReviewedAt = &reviewedAt
+		}
+	}
+	if consumedAtRaw.Valid {
+		consumedAt, parseErr := time.Parse(time.RFC3339Nano, consumedAtRaw.String)
+		if parseErr == nil {
+			approval.ConsumedAt = &consumedAt
+		}
+	}
+	return approval, nil
+}
+
+func randomHexToken(bytesLen int) (string, error) {
+	buf := make([]byte, bytesLen)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 func HashToken(raw string) string {

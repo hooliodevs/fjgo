@@ -12,25 +12,29 @@ import (
 )
 
 type Config struct {
-	Host                 string
-	Port                 string
-	DatabasePath         string
-	WorkspacesRoot       string
-	DefaultCursorCommand string
-	PairCode             string
-	PairCodeTTLMinutes   int
-	ServerURL            string
+	Host                          string
+	Port                          string
+	DatabasePath                  string
+	WorkspacesRoot                string
+	DefaultCursorCommand          string
+	PairCode                      string
+	PairCodeTTLMinutes            int
+	ServerURL                     string
+	PrivilegeConfirmationRequired bool
+	PrivilegeConfirmationDisabled bool
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		Host:                 env("HOST", "0.0.0.0"),
-		Port:                 env("PORT", "8787"),
-		DatabasePath:         env("DATABASE_PATH", "./data/fj_relay.db"),
-		WorkspacesRoot:       env("WORKSPACES_ROOT", "./workspaces"),
-		DefaultCursorCommand: env("DEFAULT_CURSOR_COMMAND", "cursor"),
-		PairCode:             strings.TrimSpace(os.Getenv("PAIR_CODE")),
-		ServerURL:            strings.TrimSpace(os.Getenv("SERVER_URL")),
+		Host:                          env("HOST", "0.0.0.0"),
+		Port:                          env("PORT", "8787"),
+		DatabasePath:                  env("DATABASE_PATH", "./data/fj_relay.db"),
+		WorkspacesRoot:                env("WORKSPACES_ROOT", "./workspaces"),
+		DefaultCursorCommand:          env("DEFAULT_CURSOR_COMMAND", "cursor"),
+		PairCode:                      strings.TrimSpace(os.Getenv("PAIR_CODE")),
+		ServerURL:                     strings.TrimSpace(os.Getenv("SERVER_URL")),
+		PrivilegeConfirmationRequired: envBool("PRIVILEGE_CONFIRMATION_REQUIRED", true),
+		PrivilegeConfirmationDisabled: envBool("PRIVILEGE_CONFIRMATION_DISABLED", false),
 	}
 
 	ttlRaw := env("PAIR_CODE_TTL_MINUTES", "43200")
@@ -72,6 +76,21 @@ func env(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func envBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func generatePairCode() (string, error) {

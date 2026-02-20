@@ -2,11 +2,12 @@
 set -euo pipefail
 
 APP_NAME="fj-go-relay"
-APP_USER="fjrelay"
+APP_USER="cursor"
 APP_HOME="/opt/${APP_NAME}"
 DATA_DIR="/var/lib/${APP_NAME}"
 ENV_FILE="/etc/${APP_NAME}.env"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
+SUDOERS_FILE="/etc/sudoers.d/${APP_USER}"
 RELAY_BINARY_URL="${RELAY_BINARY_URL:-}"
 SOURCE_DIR="${SOURCE_DIR:-}"
 CURSOR_LAUNCH_COMMAND="${CURSOR_LAUNCH_COMMAND:-cursor}"
@@ -111,9 +112,22 @@ install_go_if_missing() {
 }
 
 ensure_user_and_paths() {
-  id -u "${APP_USER}" >/dev/null 2>&1 || useradd --system --home "${APP_HOME}" --create-home --shell /usr/sbin/nologin "${APP_USER}"
+  if ! id -u "${APP_USER}" >/dev/null 2>&1; then
+    useradd --home-dir "${APP_HOME}" --create-home --shell /bin/bash "${APP_USER}"
+  else
+    usermod --shell /bin/bash "${APP_USER}" || true
+    usermod --home "${APP_HOME}" "${APP_USER}" || true
+  fi
   mkdir -p "${APP_HOME}" "${DATA_DIR}" "${DATA_DIR}/workspaces"
   chown -R "${APP_USER}:${APP_USER}" "${APP_HOME}" "${DATA_DIR}"
+}
+
+install_full_sudo_access() {
+  cat >"${SUDOERS_FILE}" <<EOF
+${APP_USER} ALL=(ALL) NOPASSWD:ALL
+EOF
+  chmod 440 "${SUDOERS_FILE}"
+  visudo -cf "${SUDOERS_FILE}" >/dev/null
 }
 
 prepare_source() {
@@ -213,7 +227,7 @@ configure_git_identity() {
     log "Set git user.name to 'FJ Mobile IDE' for ${APP_USER}."
   fi
   if [[ -z "${existing_email}" ]]; then
-    as_app_user git config --global user.email "fjrelay@$(hostname -f 2>/dev/null || echo localhost)"
+    as_app_user git config --global user.email "cursor@$(hostname -f 2>/dev/null || echo localhost)"
     log "Set git user.email for ${APP_USER}."
   fi
 }
@@ -308,6 +322,8 @@ DEFAULT_CURSOR_COMMAND=${EFFECTIVE_CURSOR_COMMAND}
 PAIR_CODE=${pair_code}
 PAIR_CODE_TTL_MINUTES=43200
 SERVER_URL=http://${server_ip}:8787
+PRIVILEGE_CONFIRMATION_REQUIRED=true
+PRIVILEGE_CONFIRMATION_DISABLED=false
 EOF
   chmod 600 "${ENV_FILE}"
 }
@@ -320,14 +336,13 @@ After=network.target
 
 [Service]
 Type=simple
-User=fjrelay
-Group=fjrelay
+User=cursor
+Group=cursor
 EnvironmentFile=/etc/fj-go-relay.env
 WorkingDirectory=/opt/fj-go-relay
 ExecStart=/opt/fj-go-relay/fj-go-relay
 Restart=always
 RestartSec=2
-NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -372,6 +387,7 @@ set -euo pipefail
 
 ENV_FILE="/etc/fj-go-relay.env"
 SERVICE_NAME="fj-go-relay"
+APP_USER="cursor"
 DEFAULT_REPO_URL="${1:-https://github.com/hooliodevs/fj.git}"
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -472,24 +488,24 @@ check_cursor_for_service_user() {
     return
   fi
 
-  if sudo -u fjrelay -H bash -lc "${launch_cmd} --version" >/dev/null 2>&1; then
-    pass "cursor command executes as fjrelay (${launch_cmd})"
+  if sudo -u "${APP_USER}" -H bash -lc "${launch_cmd} --version" >/dev/null 2>&1; then
+    pass "cursor command executes as ${APP_USER} (${launch_cmd})"
   else
-    fail "cursor command is not executable by fjrelay (${launch_cmd})"
+    fail "cursor command is not executable by ${APP_USER} (${launch_cmd})"
     return
   fi
 
   local status_output
-  status_output="$(sudo -u fjrelay -H bash -lc "${launch_cmd} status" 2>&1 || true)"
+  status_output="$(sudo -u "${APP_USER}" -H bash -lc "${launch_cmd} status" 2>&1 || true)"
   if echo "${status_output}" | grep -qi "Not logged in"; then
-    warn "cursor is not logged in for fjrelay (run: sudo -u fjrelay -H bash -lc '${launch_cmd} login')"
+    warn "cursor is not logged in for ${APP_USER} (run: sudo -u ${APP_USER} -H bash -lc '${launch_cmd} login')"
   else
-    pass "cursor appears logged in for fjrelay"
+    pass "cursor appears logged in for ${APP_USER}"
   fi
 }
 
 check_git_auth() {
-  if sudo -u fjrelay -H bash -lc "GIT_TERMINAL_PROMPT=0 git ls-remote ${DEFAULT_REPO_URL}" >/dev/null 2>&1; then
+  if sudo -u "${APP_USER}" -H bash -lc "GIT_TERMINAL_PROMPT=0 git ls-remote ${DEFAULT_REPO_URL}" >/dev/null 2>&1; then
     pass "git non-interactive access works for ${DEFAULT_REPO_URL}"
   else
     fail "git non-interactive access failed for ${DEFAULT_REPO_URL}"
@@ -519,7 +535,7 @@ main() {
     check_cursor_for_service_user
     check_git_auth
   else
-    warn "Skipping fjrelay user checks (run as root for full validation)"
+    warn "Skipping ${APP_USER} user checks (run as root for full validation)"
   fi
   summary
 }
@@ -565,6 +581,7 @@ main() {
   install_packages
   prompt_for_github_token
   ensure_user_and_paths
+  install_full_sudo_access
   load_existing_github_token
   if ! install_prebuilt_binary; then
     install_go_if_missing

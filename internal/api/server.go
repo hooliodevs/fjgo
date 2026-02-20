@@ -324,6 +324,12 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case action == "" && r.Method == http.MethodDelete:
 		s.handleDeleteSession(w, r, sessionID)
+	case action == "approvals" && len(parts) == 3 && parts[2] == "pending" && r.Method == http.MethodGet:
+		s.handleListPendingApprovals(w, r, sessionID)
+	case action == "approvals" && len(parts) == 2 && r.Method == http.MethodPost:
+		s.handleCreateApproval(w, r, sessionID)
+	case action == "approvals" && len(parts) == 4 && parts[3] == "confirm" && r.Method == http.MethodPost:
+		s.handleConfirmApproval(w, r, sessionID, strings.TrimSpace(parts[2]))
 	case action == "messages" && r.Method == http.MethodGet:
 		s.handleListMessages(w, r, sessionID)
 	case action == "input" && r.Method == http.MethodPost:
@@ -437,7 +443,37 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sess
 		return
 	}
 
-	_, err = s.store.AddMessage(r.Context(), sessionID, "user", req.Content, "")
+	originalPrompt := req.Content
+	runtimePrompt := originalPrompt
+	requireApprovals := s.cfg.PrivilegeConfirmationRequired && !s.cfg.PrivilegeConfirmationDisabled
+	if requireApprovals {
+		if pending, exists, pendingErr := s.store.PendingPrivilegeApproval(r.Context(), userID, sessionID); pendingErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to check privileged approval state"})
+			return
+		} else if exists {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":    "privileged commands are pending explicit confirmation",
+				"approval": pending,
+			})
+			return
+		}
+	}
+
+	var approvedForRun store.PrivilegeApproval
+	var hasApprovedForRun bool
+	if requireApprovals {
+		approvedForRun, hasApprovedForRun, err = s.store.NextApprovedPrivilegeApproval(r.Context(), userID, sessionID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to check approved privileged commands"})
+			return
+		}
+		if hasApprovedForRun {
+			runtimePrompt = injectApprovedPrivilegePrompt(runtimePrompt, approvedForRun)
+		}
+		runtimePrompt = injectPrivilegeConfirmationPolicy(runtimePrompt)
+	}
+
+	_, err = s.store.AddMessage(r.Context(), sessionID, "user", originalPrompt, "")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to persist input"})
 		return
@@ -448,9 +484,12 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sess
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("failed to start runtime: %v", err)})
 		return
 	}
-	if err := rt.SendInput(req.Content); err != nil {
+	if err := rt.SendInput(runtimePrompt); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to send input to runtime"})
 		return
+	}
+	if hasApprovedForRun {
+		_ = s.store.MarkPrivilegeApprovalConsumed(r.Context(), userID, sessionID, approvedForRun.ID)
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
@@ -562,4 +601,28 @@ func inferNameFromRepo(repo string) string {
 		return "workspace"
 	}
 	return name
+}
+
+func injectPrivilegeConfirmationPolicy(prompt string) string {
+	return strings.TrimSpace(`
+System policy for this session:
+- If any requested action may require elevated privileges (examples: sudo, apt, dnf, yum, apk, systemctl, user/group changes, writing under /etc, /usr, /var, /opt), DO NOT execute those commands yet.
+- First respond with exactly:
+PRIVILEGED_COMMANDS:
+<one full command per line>
+END_PRIVILEGED_COMMANDS
+- After listing commands, stop and wait for explicit approval.
+- If no elevated privileges are needed, continue normally.
+`) + "\n\nUser request:\n" + prompt
+}
+
+func injectApprovedPrivilegePrompt(prompt string, approval store.PrivilegeApproval) string {
+	return strings.TrimSpace(fmt.Sprintf(`
+Privileged command approval has already been granted for this session.
+Approval key: %s
+Allowed commands (run only these privileged commands exactly as listed):
+%s
+
+When executing privileged work, do not run any additional elevated command outside this list.
+`, approval.ApprovalKey, strings.Join(approval.Commands, "\n"))) + "\n\nUser request:\n" + prompt
 }
