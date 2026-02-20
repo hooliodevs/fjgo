@@ -286,7 +286,21 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	userID := auth.UserID(r.Context())
-	sessions, err := s.store.ListSessions(r.Context(), userID)
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+
+	var (
+		sessions []store.Session
+		err      error
+	)
+	if workspaceID != "" {
+		if _, lookupErr := s.store.WorkspaceByID(r.Context(), userID, workspaceID); lookupErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "workspace does not exist"})
+			return
+		}
+		sessions, err = s.store.ListSessionsByWorkspace(r.Context(), userID, workspaceID)
+	} else {
+		sessions, err = s.store.ListSessions(r.Context(), userID)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to list sessions"})
 		return
@@ -297,14 +311,19 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
 	parts := strings.Split(path, "/")
-	if len(parts) < 2 {
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 		return
 	}
 	sessionID := parts[0]
-	action := parts[1]
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
 
 	switch {
+	case action == "" && r.Method == http.MethodDelete:
+		s.handleDeleteSession(w, r, sessionID)
 	case action == "messages" && r.Method == http.MethodGet:
 		s.handleListMessages(w, r, sessionID)
 	case action == "input" && r.Method == http.MethodPost:
@@ -349,6 +368,24 @@ func (s *Server) handleSessionModel(w http.ResponseWriter, r *http.Request, sess
 	}
 	s.runtime.UpdateSessionModel(sessionID, req.Model)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "model": req.Model})
+}
+
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, sessionID string) {
+	userID := auth.UserID(r.Context())
+	if _, err := s.store.SessionByID(r.Context(), userID, sessionID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "session not found"})
+		return
+	}
+
+	// Best effort: tear down active runtime before removing persisted session.
+	s.runtime.StopSession(sessionID)
+
+	if err := s.store.DeleteSession(r.Context(), userID, sessionID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to delete session"})
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request, sessionID string) {
@@ -493,7 +530,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

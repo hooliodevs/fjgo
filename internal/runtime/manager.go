@@ -126,6 +126,16 @@ func (m *Manager) UpdateSessionModel(sessionID, model string) {
 	rt.SetModel(model)
 }
 
+func (m *Manager) StopSession(sessionID string) {
+	m.mu.Lock()
+	rt, ok := m.runtimes[sessionID]
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	_ = rt.shutdown()
+}
+
 func (m *Manager) startRuntime(session store.Session, workspace store.Workspace) (*SessionRuntime, error) {
 	command := strings.TrimSpace(session.LaunchCommand)
 	if command == "" {

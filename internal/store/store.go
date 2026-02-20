@@ -460,6 +460,58 @@ func (s *Store) ListSessions(ctx context.Context, userID string) ([]Session, err
 	return sessions, rows.Err()
 }
 
+func (s *Store) ListSessionsByWorkspace(ctx context.Context, userID, workspaceID string) ([]Session, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, user_id, workspace_id, name, launch_command, cursor_chat_id, cursor_model, state, last_error, created_at, last_active_at
+		 FROM sessions
+		 WHERE user_id = ? AND workspace_id = ?
+		 ORDER BY last_active_at DESC`,
+		userID,
+		workspaceID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var session Session
+		var createdAt, lastActiveAt string
+		if err := rows.Scan(
+			&session.ID,
+			&session.UserID,
+			&session.WorkspaceID,
+			&session.Name,
+			&session.LaunchCommand,
+			&session.CursorChatID,
+			&session.CursorModel,
+			&session.State,
+			&session.LastError,
+			&createdAt,
+			&lastActiveAt,
+		); err != nil {
+			return nil, err
+		}
+		session.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		session.LastActiveAt, _ = time.Parse(time.RFC3339Nano, lastActiveAt)
+		sessions = append(sessions, session)
+	}
+	return sessions, rows.Err()
+}
+
+func (s *Store) DeleteSession(ctx context.Context, userID, sessionID string) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`DELETE FROM sessions
+		 WHERE id = ? AND user_id = ?`,
+		sessionID,
+		userID,
+	)
+	return err
+}
+
 func (s *Store) UpdateSessionState(ctx context.Context, sessionID, state, lastError string) error {
 	_, err := s.db.ExecContext(
 		ctx,
