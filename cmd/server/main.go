@@ -43,6 +43,9 @@ func main() {
 	if err := st.SetPairCode(ctx, cfg.PairCode, cfg.PairCodeExpiry()); err != nil {
 		log.Fatalf("set pair code: %v", err)
 	}
+	if _, err := st.EnsurePrivilegeConfirmationRequired(ctx, cfg.PrivilegeConfirmationRequired); err != nil {
+		log.Fatalf("ensure privilege confirmation setting: %v", err)
+	}
 
 	rt := runtime.NewManager(st)
 	srv := api.New(cfg, st, rt)

@@ -2,12 +2,13 @@
 set -euo pipefail
 
 APP_NAME="fj-go-relay"
-APP_USER="cursor"
+APP_USER="fjgo"
 APP_HOME="/opt/${APP_NAME}"
 DATA_DIR="/var/lib/${APP_NAME}"
 ENV_FILE="/etc/${APP_NAME}.env"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 SUDOERS_FILE="/etc/sudoers.d/${APP_USER}"
+LEGACY_SUDOERS_FILES=("/etc/sudoers.d/cursor" "/etc/sudoers.d/fjrelay" "/etc/sudoers.d/fj-go-relay")
 RELAY_BINARY_URL="${RELAY_BINARY_URL:-}"
 SOURCE_DIR="${SOURCE_DIR:-}"
 CURSOR_LAUNCH_COMMAND="${CURSOR_LAUNCH_COMMAND:-cursor}"
@@ -18,6 +19,7 @@ GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 TMP_SRC_DIR="/tmp/fj-go-relay-src"
 PAIR_INFO_CMD="/usr/local/bin/fj-go-relay-info"
 SELF_CHECK_CMD="/usr/local/bin/fj-go-relay-self-check"
+PRIV_CONFIRM_CMD="/usr/local/bin/fj-go-relay-privilege-confirmation"
 
 log() {
   echo "[fj-install] $*" >&2
@@ -112,6 +114,19 @@ install_go_if_missing() {
 }
 
 ensure_user_and_paths() {
+  local legacy_user=""
+  if [[ "${APP_USER}" != "cursor" ]] && id -u "cursor" >/dev/null 2>&1; then
+    legacy_user="cursor"
+  elif [[ "${APP_USER}" != "fjrelay" ]] && id -u "fjrelay" >/dev/null 2>&1; then
+    legacy_user="fjrelay"
+  elif [[ "${APP_USER}" != "fj-go-relay" ]] && id -u "fj-go-relay" >/dev/null 2>&1; then
+    legacy_user="fj-go-relay"
+  fi
+
+  if [[ -n "${legacy_user}" ]]; then
+    log "Detected legacy service user '${legacy_user}'; migrating to '${APP_USER}'."
+  fi
+
   if ! id -u "${APP_USER}" >/dev/null 2>&1; then
     useradd --home-dir "${APP_HOME}" --create-home --shell /bin/bash "${APP_USER}"
   else
@@ -128,6 +143,11 @@ ${APP_USER} ALL=(ALL) NOPASSWD:ALL
 EOF
   chmod 440 "${SUDOERS_FILE}"
   visudo -cf "${SUDOERS_FILE}" >/dev/null
+  for legacy in "${LEGACY_SUDOERS_FILES[@]}"; do
+    if [[ -f "${legacy}" && "${legacy}" != "${SUDOERS_FILE}" ]]; then
+      rm -f "${legacy}"
+    fi
+  done
 }
 
 prepare_source() {
@@ -227,7 +247,7 @@ configure_git_identity() {
     log "Set git user.name to 'FJ Mobile IDE' for ${APP_USER}."
   fi
   if [[ -z "${existing_email}" ]]; then
-    as_app_user git config --global user.email "cursor@$(hostname -f 2>/dev/null || echo localhost)"
+    as_app_user git config --global user.email "${APP_USER}@$(hostname -f 2>/dev/null || echo localhost)"
     log "Set git user.email for ${APP_USER}."
   fi
 }
@@ -323,21 +343,20 @@ PAIR_CODE=${pair_code}
 PAIR_CODE_TTL_MINUTES=43200
 SERVER_URL=http://${server_ip}:8787
 PRIVILEGE_CONFIRMATION_REQUIRED=true
-PRIVILEGE_CONFIRMATION_DISABLED=false
 EOF
   chmod 600 "${ENV_FILE}"
 }
 
 install_service() {
-  cat >"${SERVICE_FILE}" <<'EOF'
+  cat >"${SERVICE_FILE}" <<EOF
 [Unit]
 Description=FJ Mobile IDE Go Relay
 After=network.target
 
 [Service]
 Type=simple
-User=cursor
-Group=cursor
+User=${APP_USER}
+Group=${APP_USER}
 EnvironmentFile=/etc/fj-go-relay.env
 WorkingDirectory=/opt/fj-go-relay
 ExecStart=/opt/fj-go-relay/fj-go-relay
@@ -380,6 +399,138 @@ EOF
   chmod 755 "${PAIR_INFO_CMD}"
 }
 
+install_privilege_confirmation_command() {
+  cat >"${PRIV_CONFIRM_CMD}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/fj-go-relay.env"
+SERVICE_NAME="fj-go-relay"
+
+normalize_bool() {
+  local value
+  value="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${value}" in
+    1|true|yes|y|on) echo "true" ;;
+    *) echo "false" ;;
+  esac
+}
+
+get_env_value() {
+  local key="${1}"
+  local fallback="${2}"
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "${fallback}"
+    return
+  fi
+  local value
+  value="$(awk -F= -v k="${key}" '$1==k {v=$2} END {print v}' "${ENV_FILE}")"
+  if [[ -z "${value}" ]]; then
+    echo "${fallback}"
+  else
+    echo "${value}"
+  fi
+}
+
+upsert_env_value() {
+  local key="${1}"
+  local value="${2}"
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "Env file missing: ${ENV_FILE}" >&2
+    exit 1
+  fi
+  if grep -q "^${key}=" "${ENV_FILE}"; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "${ENV_FILE}"
+  else
+    printf "%s=%s\n" "${key}" "${value}" >> "${ENV_FILE}"
+  fi
+}
+
+print_status() {
+  local required
+  required="$(normalize_bool "$(get_env_value "PRIVILEGE_CONFIRMATION_REQUIRED" "true")")"
+  echo "PRIVILEGE_CONFIRMATION_REQUIRED=${required}"
+  echo "effective_status=$(if [[ "${required}" == "true" ]]; then echo enabled; else echo disabled; fi)"
+}
+
+apply_state() {
+  local target="${1}"
+  case "${target}" in
+    enable)
+      upsert_env_value "PRIVILEGE_CONFIRMATION_REQUIRED" "true"
+      ;;
+    disable)
+      upsert_env_value "PRIVILEGE_CONFIRMATION_REQUIRED" "false"
+      ;;
+    *)
+      echo "Unknown state: ${target}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+ensure_root() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo "$0" "$@"
+  fi
+  echo "Please run as root (or via sudo)." >&2
+  exit 1
+}
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [status|enable|disable|toggle]
+
+status   Show current privilege confirmation values and effective state.
+enable   Require privilege confirmation (updates env + restarts service).
+disable  Disable privilege confirmation (updates env + restarts service).
+toggle   Flip effective state between enabled/disabled.
+USAGE
+}
+
+main() {
+  local command="${1:-status}"
+  case "${command}" in
+    status)
+      print_status
+      ;;
+    enable|disable)
+      ensure_root "$@"
+      apply_state "${command}"
+      systemctl restart "${SERVICE_NAME}"
+      echo "Updated privilege confirmation to: ${command}"
+      print_status
+      ;;
+    toggle)
+      ensure_root "$@"
+      if [[ "$(normalize_bool "$(get_env_value "PRIVILEGE_CONFIRMATION_REQUIRED" "true")")" == "true" ]]; then
+        apply_state "disable"
+        echo "Updated privilege confirmation to: disable"
+      else
+        apply_state "enable"
+        echo "Updated privilege confirmation to: enable"
+      fi
+      systemctl restart "${SERVICE_NAME}"
+      print_status
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
+EOF
+  chmod 755 "${PRIV_CONFIRM_CMD}"
+}
+
 install_self_check_command() {
   cat >"${SELF_CHECK_CMD}" <<'EOF'
 #!/usr/bin/env bash
@@ -387,7 +538,7 @@ set -euo pipefail
 
 ENV_FILE="/etc/fj-go-relay.env"
 SERVICE_NAME="fj-go-relay"
-APP_USER="cursor"
+APP_USER="__APP_USER__"
 DEFAULT_REPO_URL="${1:-https://github.com/hooliodevs/fj.git}"
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -478,6 +629,16 @@ check_env_and_pair() {
   else
     fail "fj-go-relay-info command missing"
   fi
+
+  if command -v fj-go-relay-privilege-confirmation >/dev/null 2>&1; then
+    if fj-go-relay-privilege-confirmation status >/dev/null 2>&1; then
+      pass "fj-go-relay-privilege-confirmation command works"
+    else
+      fail "fj-go-relay-privilege-confirmation command failed"
+    fi
+  else
+    fail "fj-go-relay-privilege-confirmation command missing"
+  fi
 }
 
 check_cursor_for_service_user() {
@@ -542,6 +703,7 @@ main() {
 
 main "$@"
 EOF
+  sed -i "s|__APP_USER__|${APP_USER}|g" "${SELF_CHECK_CMD}"
   chmod 755 "${SELF_CHECK_CMD}"
 }
 
@@ -573,6 +735,8 @@ print_pairing_info() {
   log "  ${PAIR_INFO_CMD}"
   log "Self-check command:"
   log "  ${SELF_CHECK_CMD}"
+  log "Privilege confirmation command:"
+  log "  ${PRIV_CONFIRM_CMD} [status|enable|disable|toggle]"
   log "----------------------------------------------------------"
 }
 
@@ -595,6 +759,7 @@ main() {
   write_env_file
   install_service
   install_pair_info_command
+  install_privilege_confirmation_command
   install_self_check_command
   print_pairing_info
 }

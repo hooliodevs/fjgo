@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 )
 
 const defaultUserID = "local-user"
+const settingPrivilegeConfirmationRequired = "privilege_confirmation_required"
 
 type Store struct {
 	db *sql.DB
@@ -197,6 +199,35 @@ func (s *Store) Setting(ctx context.Context, key string) (string, error) {
 	return value, err
 }
 
+func (s *Store) EnsurePrivilegeConfirmationRequired(ctx context.Context, defaultValue bool) (bool, error) {
+	existing, err := s.Setting(ctx, settingPrivilegeConfirmationRequired)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(existing) == "" {
+		if err := s.SetPrivilegeConfirmationRequired(ctx, defaultValue); err != nil {
+			return false, err
+		}
+		return defaultValue, nil
+	}
+	return parseBool(existing, defaultValue), nil
+}
+
+func (s *Store) PrivilegeConfirmationRequired(ctx context.Context, defaultValue bool) (bool, error) {
+	existing, err := s.Setting(ctx, settingPrivilegeConfirmationRequired)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(existing) == "" {
+		return defaultValue, nil
+	}
+	return parseBool(existing, defaultValue), nil
+}
+
+func (s *Store) SetPrivilegeConfirmationRequired(ctx context.Context, required bool) error {
+	return s.UpsertSetting(ctx, settingPrivilegeConfirmationRequired, strconv.FormatBool(required))
+}
+
 func (s *Store) EnsureServerID(ctx context.Context) (string, error) {
 	existing, err := s.Setting(ctx, "server_id")
 	if err != nil {
@@ -211,6 +242,17 @@ func (s *Store) EnsureServerID(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return id, nil
+}
+
+func parseBool(raw string, fallback bool) bool {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func (s *Store) SetPairCode(ctx context.Context, code string, expiresAt time.Time) error {

@@ -21,7 +21,6 @@ type Config struct {
 	PairCodeTTLMinutes            int
 	ServerURL                     string
 	PrivilegeConfirmationRequired bool
-	PrivilegeConfirmationDisabled bool
 }
 
 func Load() (Config, error) {
@@ -34,7 +33,6 @@ func Load() (Config, error) {
 		PairCode:                      strings.TrimSpace(os.Getenv("PAIR_CODE")),
 		ServerURL:                     strings.TrimSpace(os.Getenv("SERVER_URL")),
 		PrivilegeConfirmationRequired: envBool("PRIVILEGE_CONFIRMATION_REQUIRED", true),
-		PrivilegeConfirmationDisabled: envBool("PRIVILEGE_CONFIRMATION_DISABLED", false),
 	}
 
 	ttlRaw := env("PAIR_CODE_TTL_MINUTES", "43200")

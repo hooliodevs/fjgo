@@ -148,6 +148,10 @@ func (s *Server) routeAuthed(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/v1/server/pairing" && r.Method == http.MethodGet:
 		s.handleServerPairing(w, r)
+	case r.URL.Path == "/v1/server/settings/privilege-confirmation" && r.Method == http.MethodGet:
+		s.handleGetPrivilegeConfirmationSetting(w, r)
+	case r.URL.Path == "/v1/server/settings/privilege-confirmation" && r.Method == http.MethodPost:
+		s.handleSetPrivilegeConfirmationSetting(w, r)
 	case r.URL.Path == "/v1/workspaces" && r.Method == http.MethodGet:
 		s.handleListWorkspaces(w, r)
 	case r.URL.Path == "/v1/workspaces/clone" && r.Method == http.MethodPost:
@@ -175,6 +179,37 @@ func (s *Server) handleServerPairing(w http.ResponseWriter, r *http.Request) {
 		"pair_code":            pairCode,
 		"pair_code_expires_at": expiresAt,
 	})
+}
+
+type privilegeConfirmationSettingResponse struct {
+	Required bool `json:"required"`
+}
+
+type setPrivilegeConfirmationSettingRequest struct {
+	Required bool `json:"required"`
+}
+
+func (s *Server) handleGetPrivilegeConfirmationSetting(w http.ResponseWriter, r *http.Request) {
+	required, err := s.store.PrivilegeConfirmationRequired(r.Context(), s.cfg.PrivilegeConfirmationRequired)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to load privilege confirmation setting"})
+		return
+	}
+	writeJSON(w, http.StatusOK, privilegeConfirmationSettingResponse{Required: required})
+}
+
+func (s *Server) handleSetPrivilegeConfirmationSetting(w http.ResponseWriter, r *http.Request) {
+	var req setPrivilegeConfirmationSettingRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	if err := s.store.SetPrivilegeConfirmationRequired(r.Context(), req.Required); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to update privilege confirmation setting"})
+		return
+	}
+	writeJSON(w, http.StatusOK, privilegeConfirmationSettingResponse{Required: req.Required})
 }
 
 type cloneWorkspaceRequest struct {
@@ -445,7 +480,11 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sess
 
 	originalPrompt := req.Content
 	runtimePrompt := originalPrompt
-	requireApprovals := s.cfg.PrivilegeConfirmationRequired && !s.cfg.PrivilegeConfirmationDisabled
+	requireApprovals, err := s.store.PrivilegeConfirmationRequired(r.Context(), s.cfg.PrivilegeConfirmationRequired)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to load privilege confirmation setting"})
+		return
+	}
 	if requireApprovals {
 		if pending, exists, pendingErr := s.store.PendingPrivilegeApproval(r.Context(), userID, sessionID); pendingErr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to check privileged approval state"})
