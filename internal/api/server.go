@@ -50,6 +50,7 @@ func New(cfg config.Config, s *store.Store, r *runtime.Manager) *Server {
 
 	protected := authMiddleware(server.auth, http.HandlerFunc(server.routeAuthed))
 	mux.Handle("/v1/server/pairing", protected)
+	mux.Handle("/v1/server/settings/privilege-confirmation", protected)
 	mux.Handle("/v1/workspaces", protected)
 	mux.Handle("/v1/workspaces/clone", protected)
 	mux.Handle("/v1/workspaces/", protected)
