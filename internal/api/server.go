@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,6 +22,7 @@ import (
 	"fj_go_server/internal/runtime"
 	"fj_go_server/internal/store"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -31,6 +34,12 @@ type Server struct {
 	upgrader   websocket.Upgrader
 	httpServer *http.Server
 }
+
+const (
+	maxInputAttachments     = 4
+	maxInputAttachmentBytes = 10 * 1024 * 1024
+	maxInputMultipartMemory = 32 << 20
+)
 
 func New(cfg config.Config, s *store.Store, r *runtime.Manager) *Server {
 	server := &Server{
@@ -360,6 +369,8 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case action == "" && r.Method == http.MethodDelete:
 		s.handleDeleteSession(w, r, sessionID)
+	case action == "attachments" && len(parts) == 3 && r.Method == http.MethodGet:
+		s.handleSessionAttachment(w, r, sessionID, strings.TrimSpace(parts[2]))
 	case action == "approvals" && len(parts) == 3 && parts[2] == "pending" && r.Method == http.MethodGet:
 		s.handleListPendingApprovals(w, r, sessionID)
 	case action == "approvals" && len(parts) == 2 && r.Method == http.MethodPost:
@@ -422,12 +433,68 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, ses
 	// Best effort: tear down active runtime before removing persisted session.
 	s.runtime.StopSession(sessionID)
 
+	if err := s.deleteSessionAttachments(sessionID); err != nil {
+		log.Printf("delete session attachments failed session_id=%q err=%v", sessionID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to delete session attachments"})
+		return
+	}
+
 	if err := s.store.DeleteSession(r.Context(), userID, sessionID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to delete session"})
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteSessionAttachments(sessionID string) error {
+	attachmentsRoot := filepath.Join(s.cfg.WorkspacesRoot, ".session_uploads")
+	targetPath := filepath.Join(attachmentsRoot, sessionID)
+
+	absRoot, err := filepath.Abs(attachmentsRoot)
+	if err != nil {
+		return fmt.Errorf("resolve attachments root: %w", err)
+	}
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return fmt.Errorf("resolve attachment target: %w", err)
+	}
+
+	// Defensive guard: session IDs must resolve under the attachment root.
+	prefix := absRoot + string(os.PathSeparator)
+	if absTarget == absRoot || !strings.HasPrefix(absTarget, prefix) {
+		return fmt.Errorf("invalid attachment target path for session %q", sessionID)
+	}
+
+	if err := os.RemoveAll(absTarget); err != nil {
+		return fmt.Errorf("remove attachment directory: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) handleSessionAttachment(w http.ResponseWriter, r *http.Request, sessionID, filename string) {
+	userID := auth.UserID(r.Context())
+	if _, err := s.store.SessionByID(r.Context(), userID, sessionID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "session not found"})
+		return
+	}
+	filename = strings.TrimSpace(filename)
+	if filename == "" || strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid attachment path"})
+		return
+	}
+
+	absPath, err := s.safeAttachmentPath(sessionID, filename)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid attachment path"})
+		return
+	}
+	info, err := os.Stat(absPath)
+	if err != nil || info.IsDir() {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "attachment not found"})
+		return
+	}
+	http.ServeFile(w, r, absPath)
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request, sessionID string) {
@@ -460,6 +527,11 @@ type sessionInputRequest struct {
 	Content string `json:"content"`
 }
 
+type parsedSessionInput struct {
+	Content     string
+	Attachments []store.MessageAttachment
+}
+
 func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sessionID string) {
 	userID := auth.UserID(r.Context())
 	_, err := s.store.SessionByID(r.Context(), userID, sessionID)
@@ -468,19 +540,17 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sess
 		return
 	}
 
-	var req sessionInputRequest
-	if err := decodeBody(r, &req); err != nil {
+	input, err := s.parseSessionInput(r, sessionID)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	req.Content = strings.TrimSpace(req.Content)
-	if req.Content == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "content is required"})
-		return
-	}
 
-	originalPrompt := req.Content
+	originalPrompt := input.Content
 	runtimePrompt := originalPrompt
+	if len(input.Attachments) > 0 {
+		runtimePrompt = injectAttachmentPathsPrompt(runtimePrompt, input.Attachments)
+	}
 	requireApprovals, err := s.store.PrivilegeConfirmationRequired(r.Context(), s.cfg.PrivilegeConfirmationRequired)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to load privilege confirmation setting"})
@@ -513,7 +583,7 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sess
 		runtimePrompt = injectPrivilegeConfirmationPolicy(runtimePrompt)
 	}
 
-	_, err = s.store.AddMessage(r.Context(), sessionID, "user", originalPrompt, "")
+	_, err = s.store.AddMessage(r.Context(), sessionID, "user", originalPrompt, "", input.Attachments)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to persist input"})
 		return
@@ -533,6 +603,160 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request, sess
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+func (s *Server) parseSessionInput(r *http.Request, sessionID string) (parsedSessionInput, error) {
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return s.parseMultipartSessionInput(r, sessionID)
+	}
+	var req sessionInputRequest
+	if err := decodeBody(r, &req); err != nil {
+		return parsedSessionInput{}, err
+	}
+	req.Content = strings.TrimSpace(req.Content)
+	if req.Content == "" {
+		return parsedSessionInput{}, errors.New("content is required")
+	}
+	return parsedSessionInput{Content: req.Content, Attachments: []store.MessageAttachment{}}, nil
+}
+
+func (s *Server) parseMultipartSessionInput(r *http.Request, sessionID string) (parsedSessionInput, error) {
+	if err := r.ParseMultipartForm(maxInputMultipartMemory); err != nil {
+		return parsedSessionInput{}, fmt.Errorf("invalid multipart request: %w", err)
+	}
+	content := strings.TrimSpace(r.FormValue("content"))
+	files := r.MultipartForm.File["attachments"]
+	if len(files) == 0 {
+		files = r.MultipartForm.File["attachments[]"]
+	}
+	if len(files) > maxInputAttachments {
+		return parsedSessionInput{}, fmt.Errorf("too many attachments (max %d)", maxInputAttachments)
+	}
+
+	attachments := make([]store.MessageAttachment, 0, len(files))
+	for _, fileHeader := range files {
+		attachment, err := s.saveSessionAttachment(r, sessionID, fileHeader)
+		if err != nil {
+			return parsedSessionInput{}, err
+		}
+		attachments = append(attachments, attachment)
+	}
+	if content == "" && len(attachments) == 0 {
+		return parsedSessionInput{}, errors.New("content or attachments are required")
+	}
+	return parsedSessionInput{Content: content, Attachments: attachments}, nil
+}
+
+func (s *Server) saveSessionAttachment(r *http.Request, sessionID string, fileHeader *multipart.FileHeader) (store.MessageAttachment, error) {
+	if fileHeader.Size > maxInputAttachmentBytes {
+		return store.MessageAttachment{}, fmt.Errorf("attachment %q exceeds %dMB", fileHeader.Filename, maxInputAttachmentBytes/(1024*1024))
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return store.MessageAttachment{}, fmt.Errorf("open attachment %q: %w", fileHeader.Filename, err)
+	}
+	defer file.Close()
+
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(file, head)
+	detectedType := strings.ToLower(strings.TrimSpace(http.DetectContentType(head[:n])))
+	allowedType := allowedImageMimeType(detectedType)
+	if allowedType == "" {
+		return store.MessageAttachment{}, fmt.Errorf("attachment %q must be jpeg, png, or webp", fileHeader.Filename)
+	}
+
+	ext := extensionForMimeType(allowedType)
+	if ext == "" {
+		return store.MessageAttachment{}, fmt.Errorf("unsupported attachment type for %q", fileHeader.Filename)
+	}
+	safeFilename := uuid.NewString() + ext
+	absPath, err := s.safeAttachmentPath(sessionID, safeFilename)
+	if err != nil {
+		return store.MessageAttachment{}, fmt.Errorf("invalid attachment path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		return store.MessageAttachment{}, fmt.Errorf("create attachment directory: %w", err)
+	}
+	dst, err := os.OpenFile(absPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return store.MessageAttachment{}, fmt.Errorf("create attachment file: %w", err)
+	}
+	defer dst.Close()
+
+	if _, err := dst.Write(head[:n]); err != nil {
+		return store.MessageAttachment{}, fmt.Errorf("write attachment file: %w", err)
+	}
+	if _, err := io.Copy(dst, file); err != nil {
+		return store.MessageAttachment{}, fmt.Errorf("write attachment file: %w", err)
+	}
+
+	info, err := dst.Stat()
+	if err != nil {
+		return store.MessageAttachment{}, fmt.Errorf("stat attachment file: %w", err)
+	}
+
+	return store.MessageAttachment{
+		ID:          uuid.NewString(),
+		Filename:    strings.TrimSpace(fileHeader.Filename),
+		MimeType:    allowedType,
+		SizeBytes:   info.Size(),
+		URL:         s.publicAttachmentURL(r, sessionID, safeFilename),
+		StoragePath: absPath,
+	}, nil
+}
+
+func (s *Server) publicAttachmentURL(r *http.Request, sessionID, filename string) string {
+	scheme := "http"
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") || r.TLS != nil {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s/v1/sessions/%s/attachments/%s", scheme, r.Host, sessionID, filename)
+}
+
+func (s *Server) safeAttachmentPath(sessionID, filename string) (string, error) {
+	attachmentsRoot := filepath.Join(s.cfg.WorkspacesRoot, ".session_uploads")
+	targetPath := filepath.Join(attachmentsRoot, sessionID, filename)
+	absRoot, err := filepath.Abs(attachmentsRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve attachments root: %w", err)
+	}
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve attachment target: %w", err)
+	}
+	prefix := absRoot + string(os.PathSeparator)
+	if !strings.HasPrefix(absTarget, prefix) {
+		return "", errors.New("attachment target escaped root")
+	}
+	return absTarget, nil
+}
+
+func allowedImageMimeType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "image/jpeg", "image/jpg":
+		return "image/jpeg"
+	case "image/png":
+		return "image/png"
+	case "image/webp":
+		return "image/webp"
+	default:
+		return ""
+	}
+}
+
+func extensionForMimeType(value string) string {
+	switch value {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ""
+	}
 }
 
 func (s *Server) handleSessionInterrupt(w http.ResponseWriter, r *http.Request, sessionID string) {
@@ -665,4 +889,22 @@ Allowed commands (run only these privileged commands exactly as listed):
 
 When executing privileged work, do not run any additional elevated command outside this list.
 `, approval.ApprovalKey, strings.Join(approval.Commands, "\n"))) + "\n\nUser request:\n" + prompt
+}
+
+func injectAttachmentPathsPrompt(prompt string, attachments []store.MessageAttachment) string {
+	lines := make([]string, 0, len(attachments))
+	for _, attachment := range attachments {
+		if strings.TrimSpace(attachment.StoragePath) == "" {
+			continue
+		}
+		lines = append(lines, "- "+attachment.StoragePath)
+	}
+	if len(lines) == 0 {
+		return prompt
+	}
+	header := "Attached images (local paths):\n" + strings.Join(lines, "\n")
+	if strings.TrimSpace(prompt) == "" {
+		return header
+	}
+	return prompt + "\n\n" + header
 }

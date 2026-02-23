@@ -61,12 +61,22 @@ type PrivilegeApproval struct {
 }
 
 type Message struct {
-	ID        string    `json:"id"`
-	SessionID string    `json:"session_id"`
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	Model     string    `json:"model"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          string              `json:"id"`
+	SessionID   string              `json:"session_id"`
+	Role        string              `json:"role"`
+	Content     string              `json:"content"`
+	Model       string              `json:"model"`
+	Attachments []MessageAttachment `json:"attachments"`
+	CreatedAt   time.Time           `json:"created_at"`
+}
+
+type MessageAttachment struct {
+	ID          string `json:"id"`
+	Filename    string `json:"filename"`
+	MimeType    string `json:"mime_type"`
+	SizeBytes   int64  `json:"size_bytes"`
+	URL         string `json:"url"`
+	StoragePath string `json:"storage_path"`
 }
 
 func New(db *sql.DB) *Store {
@@ -125,6 +135,7 @@ func (s *Store) Init(ctx context.Context) error {
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			model TEXT NOT NULL DEFAULT '',
+			attachments_json TEXT NOT NULL DEFAULT '[]',
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);`,
@@ -164,6 +175,9 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "messages", "model", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("ensure messages.model: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "messages", "attachments_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return fmt.Errorf("ensure messages.attachments_json: %w", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -635,24 +649,33 @@ func (s *Store) SetSessionModel(ctx context.Context, sessionID, cursorModel stri
 	return err
 }
 
-func (s *Store) AddMessage(ctx context.Context, sessionID, role, content, model string) (Message, error) {
-	message := Message{
-		ID:        uuid.NewString(),
-		SessionID: sessionID,
-		Role:      role,
-		Content:   content,
-		Model:     model,
-		CreatedAt: time.Now().UTC(),
+func (s *Store) AddMessage(ctx context.Context, sessionID, role, content, model string, attachments []MessageAttachment) (Message, error) {
+	if attachments == nil {
+		attachments = []MessageAttachment{}
 	}
-	_, err := s.db.ExecContext(
+	attachmentsRaw, err := json.Marshal(attachments)
+	if err != nil {
+		return Message{}, err
+	}
+	message := Message{
+		ID:          uuid.NewString(),
+		SessionID:   sessionID,
+		Role:        role,
+		Content:     content,
+		Model:       model,
+		Attachments: attachments,
+		CreatedAt:   time.Now().UTC(),
+	}
+	_, err = s.db.ExecContext(
 		ctx,
-		`INSERT INTO messages(id, session_id, role, content, model, created_at)
-		 VALUES(?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(id, session_id, role, content, model, attachments_json, created_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		message.ID,
 		message.SessionID,
 		message.Role,
 		message.Content,
 		message.Model,
+		string(attachmentsRaw),
 		message.CreatedAt.Format(time.RFC3339Nano),
 	)
 	return message, err
@@ -664,7 +687,7 @@ func (s *Store) ListMessages(ctx context.Context, userID, sessionID string, limi
 	}
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT m.id, m.session_id, m.role, m.content, m.model, m.created_at
+		`SELECT m.id, m.session_id, m.role, m.content, m.model, m.attachments_json, m.created_at
 		 FROM messages m
 		 JOIN sessions s ON s.id = m.session_id
 		 WHERE m.session_id = ? AND s.user_id = ?
@@ -682,16 +705,24 @@ func (s *Store) ListMessages(ctx context.Context, userID, sessionID string, limi
 	var messages []Message
 	for rows.Next() {
 		var message Message
-		var createdAt string
+		var createdAt, attachmentsRaw string
 		if err := rows.Scan(
 			&message.ID,
 			&message.SessionID,
 			&message.Role,
 			&message.Content,
 			&message.Model,
+			&attachmentsRaw,
 			&createdAt,
 		); err != nil {
 			return nil, err
+		}
+		if strings.TrimSpace(attachmentsRaw) == "" {
+			attachmentsRaw = "[]"
+		}
+		_ = json.Unmarshal([]byte(attachmentsRaw), &message.Attachments)
+		if message.Attachments == nil {
+			message.Attachments = []MessageAttachment{}
 		}
 		message.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 		messages = append(messages, message)
